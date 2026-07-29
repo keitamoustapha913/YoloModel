@@ -744,3 +744,47 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(-1, self.gamma.shape[0], 1, 1) * y
         return y
+
+
+
+class PatchStridedBackbone(nn.Module):
+    """
+    Alternative backbone using Conv :
+    Based on ViT-style patch embedding but with convolutional layers for better efficiency:
+    [B,3,640,640] -> [B,256,80,80] for patch_size=8
+    [B,3,640,640] -> [B,256,40,40] for patch_size=16
+    [B,3,640,640] -> [B,256,20,20] for patch_size=32
+    """
+    _SUPPORTED_PATCH_SIZES = (8, 16, 32, 64)
+
+    def __init__(self, in_ch=3, out_ch=256, patch_size=16):
+        super().__init__()
+        if patch_size not in self._SUPPORTED_PATCH_SIZES:
+            raise ValueError(
+                f"patch_size must be one of {self._SUPPORTED_PATCH_SIZES}, got {patch_size}."
+            )
+        if out_ch <= 0:
+            raise ValueError(f"out_ch must be > 0, got {out_ch}.")
+
+        self.patch_size = int(patch_size)
+        num_conv_layers = int(math.log2(self.patch_size))
+        stage_channels = self._build_stage_channels(out_ch=out_ch, num_stages=num_conv_layers)
+
+        layers = []
+        c_in = in_ch
+        for c_out in stage_channels:
+            layers.append(Conv(c_in, c_out, k=3, s=2, act=True))
+            c_in = c_out
+        self.model = nn.Sequential(*layers)
+
+    @staticmethod
+    def _build_stage_channels(out_ch: int, num_stages: int):
+        channels = []
+        for i in range(1, num_stages):
+            c = max(32, out_ch // (2 ** (num_stages - i)))
+            channels.append(c)
+        channels.append(out_ch)
+        return channels
+
+    def forward(self, x):
+        return self.model(x)

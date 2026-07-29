@@ -233,6 +233,164 @@ class YOLOv11BackboneVariantV13(nn.Module):
         return self.model(x)
 
 
+class YOLOv11BackboneVariantV14(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV15(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class YOLOv11BackboneVariantV16(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            PSABlock(128, 0.5, 4, True)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV17(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            C2fPSA(128, 128, 1)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV18(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            A2C2f(128, 128, 1, True, 4)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV19(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            ABlock(128, 8, 1.2, 4)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV20(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV21(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2),
+            PSABlock(64, 0.5, 4, True)
+    )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV22(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            C2PSA(128, 128, 1)
+    )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV23(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2),
+            ABlock(64, 8, 1.2, 4)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
