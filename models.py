@@ -1,8 +1,16 @@
-
-
 from yolov11_backbone import YOLOv11Backbone
-from yolov11_backbone_variant_v1 import YOLOv11BackboneVariantV1
-from yolov11_backbone_variant_v2 import YOLOv11BackboneVariantV2
-from yolov11_backbone_variant_v3 import YOLOv11BackboneVariantV3
-from yolov11_backbone_variant_v4 import YOLOv11BackboneVariantV4
-from yolov11_backbone_variant_v5 import YOLOv11BackboneVariantV5
+from yolov11_backbone_variant import (
+    YOLOv11BackboneVariantV1,
+    YOLOv11BackboneVariantV2,
+    YOLOv11BackboneVariantV3,
+    YOLOv11BackboneVariantV4,
+    YOLOv11BackboneVariantV5,
+    YOLOv11BackboneVariantV6,
+    YOLOv11BackboneVariantV7,
+    YOLOv11BackboneVariantV8,
+    YOLOv11BackboneVariantV9,
+    YOLOv11BackboneVariantV10,
+    YOLOv11BackboneVariantV11,
+    YOLOv11BackboneVariantV12,
+    YOLOv11BackboneVariantV13,
+)
