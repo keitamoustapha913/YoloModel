@@ -8,6 +8,8 @@ Run the profiling script with `uv`:
 
 ```bash
 uv run python profile_backbone.py
+uv run python profile_backbone.py --model YOLOv11Backbone
+uv run python profile_backbone.py --model YOLOv11BackboneVariantV1
 ```
 
 The script reports:
@@ -28,11 +30,17 @@ concatenation, reshaping, and other elementwise operations are not included.
 uv run python profile_backbone.py --device cuda --dtype fp16
 uv run python profile_backbone.py --height 640 --width 640 --iterations 200
 uv run python profile_backbone.py --batch-size 4
+uv run python profile_backbone.py --list-models
 ```
+
+The `--model` value must match a `torch.nn.Module` class exported by
+`models.py`. Models are instantiated with their default constructor.
 
 Available options:
 
 ```text
+--model        Model class exported by models.py; default: YOLOv11Backbone
+--list-models  List model classes exported by models.py and exit
 --height       Input height; default: 640
 --width        Input width; default: 640
 --batch-size   Batch size; default: 1

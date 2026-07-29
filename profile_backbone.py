@@ -2,6 +2,8 @@
 
 Examples:
     uv run python profile_backbone.py
+    uv run python profile_backbone.py --model YOLOv11Backbone
+    uv run python profile_backbone.py --model YOLOv11BackboneVariantV1
     uv run python profile_backbone.py --device cuda --dtype fp16
     uv run python profile_backbone.py --height 640 --width 640 --iterations 200
 
@@ -13,6 +15,8 @@ softmax, concatenation, and tensor reshaping are not included in the MAC total.
 from __future__ import annotations
 
 import argparse
+import inspect
+import importlib
 import time
 from dataclasses import dataclass
 
@@ -20,7 +24,6 @@ import torch
 from torch import nn
 
 from modules import Attention, Conv
-from yolov11_backbone import YOLOv11Backbone
 
 
 @dataclass
@@ -87,6 +90,16 @@ def count_macs(module: nn.Module, inputs: torch.Tensor) -> MacResult:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model",
+        default="YOLOv11Backbone",
+        help="Model class exported by models.py; default: YOLOv11Backbone",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List model classes exported by models.py and exit.",
+    )
     parser.add_argument("--height", type=int, default=640)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -105,6 +118,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     return parser.parse_args()
+
+
+def available_models() -> dict[str, type[nn.Module]]:
+    """Return nn.Module classes exposed by models.py."""
+
+    models_module = importlib.import_module("models")
+    return {
+        name: model_class
+        for name, model_class in inspect.getmembers(models_module, inspect.isclass)
+        if issubclass(model_class, nn.Module) and model_class is not nn.Module
+    }
+
+
+def create_model(model_name: str) -> nn.Module:
+    """Create the model class selected from models.py."""
+
+    models = available_models()
+    try:
+        model_class = models[model_name]
+    except KeyError as error:
+        available = ", ".join(sorted(models)) or "none"
+        raise ValueError(
+            f"Model {model_name!r} was not found in models.py. "
+            f"Available models: {available}"
+        ) from error
+
+    try:
+        model = model_class()
+    except TypeError as error:
+        raise TypeError(
+            f"Could not instantiate {model_name} with no arguments. "
+            "Add constructor arguments to the profiler if this model requires them."
+        ) from error
+
+    if not isinstance(model, nn.Module):
+        raise TypeError(f"{model_name} is not a torch.nn.Module")
+    return model
 
 
 def get_device(device_name: str) -> torch.device:
@@ -156,6 +206,12 @@ def benchmark(
 
 def main() -> None:
     args = parse_args()
+    models = available_models()
+    if args.list_models:
+        for model_name in sorted(models):
+            print(model_name)
+        return
+
     if args.batch_size < 1 or args.height < 1 or args.width < 1:
         raise ValueError("batch size, height, and width must be positive")
     if args.warmup < 0 or args.iterations < 1:
@@ -163,7 +219,7 @@ def main() -> None:
 
     device = get_device(args.device)
     dtype = get_dtype(args.dtype)
-    model = YOLOv11Backbone().eval().to(device=device, dtype=dtype)
+    model = create_model(args.model).eval().to(device=device, dtype=dtype)
     inputs = torch.randn(
         args.batch_size,
         3,
@@ -176,6 +232,7 @@ def main() -> None:
     result = count_macs(model, inputs)
     parameters = sum(parameter.numel() for parameter in model.parameters())
 
+    print(f"Model:      {args.model}")
     print(f"Device:     {device}")
     if device.type == "cuda":
         print(f"GPU:        {torch.cuda.get_device_name(device)}")
@@ -186,15 +243,19 @@ def main() -> None:
     print(f"MACs:       {result.macs:,} ({result.macs / 1e9:.6f} GMACs)")
     print(f"GFLOPs:     {2 * result.macs / 1e9:.6f} (2 FLOPs per MAC)")
 
-    print("\nPer-stage MACs:")
-    stage_input = inputs
-    for index, stage in enumerate(model.model):
-        stage_result = count_macs(stage, stage_input)
-        print(
-            f"  {index}: {stage_result.macs / 1e6:10.3f} MMACs "
-            f"-> {tuple(stage_result.output.shape)}"
-        )
-        stage_input = stage_result.output
+    stages = getattr(model, "model", None)
+    if isinstance(stages, (nn.Sequential, nn.ModuleList)):
+        print("\nPer-stage MACs:")
+        stage_input = inputs
+        for index, stage in enumerate(stages):
+            stage_result = count_macs(stage, stage_input)
+            print(
+                f"  {index}: {stage_result.macs / 1e6:10.3f} MMACs "
+                f"-> {tuple(stage_result.output.shape)}"
+            )
+            stage_input = stage_result.output
+    else:
+        print("\nPer-stage MACs: unavailable (model.model is not sequential)")
 
     latency_ms, images_per_second = benchmark(
         model, inputs, device, args.warmup, args.iterations
