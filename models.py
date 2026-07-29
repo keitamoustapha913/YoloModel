@@ -1,0 +1,8 @@
+
+
+from yolov11_backbone import YOLOv11Backbone
+from yolov11_backbone_variant_v1 import YOLOv11BackboneVariantV1
+from yolov11_backbone_variant_v2 import YOLOv11BackboneVariantV2
+from yolov11_backbone_variant_v3 import YOLOv11BackboneVariantV3
+from yolov11_backbone_variant_v4 import YOLOv11BackboneVariantV4
+from yolov11_backbone_variant_v5 import YOLOv11BackboneVariantV5
