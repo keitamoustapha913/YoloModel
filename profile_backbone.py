@@ -24,29 +24,51 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from modules import Attention, Conv
+from modules import Attention
 
 
 @dataclass
 class MacResult:
     macs: int
-    output: torch.Tensor
+    output: object
 
 
-def count_macs(module: nn.Module, inputs: torch.Tensor) -> MacResult:
+def format_output_shapes(output: object) -> str:
+    """Format tensor shapes from a tensor or a nested model output."""
+
+    if isinstance(output, torch.Tensor):
+        return str(tuple(output.shape))
+    if isinstance(output, tuple):
+        shapes = ", ".join(format_output_shapes(item) for item in output)
+        if len(output) == 1:
+            shapes += ","
+        return f"({shapes})"
+    if isinstance(output, list):
+        shapes = ", ".join(format_output_shapes(item) for item in output)
+        return f"[{shapes}]"
+    if isinstance(output, dict):
+        shapes = ", ".join(
+            f"{key!r}: {format_output_shapes(value)}"
+            for key, value in output.items()
+        )
+        return f"{{{shapes}}}"
+    return f"<{type(output).__name__}>"
+
+
+def count_macs(module: nn.Module, inputs: object) -> MacResult:
     """Count convolution, transposed-convolution, and attention MACs."""
 
     total = 0
     hooks = []
 
-    def count_conv(conv_module: Conv, hook_inputs, output) -> None:
+    def count_conv(conv_module: nn.Conv2d, hook_inputs, output) -> None:
         nonlocal total
         x = hook_inputs[0]
         channels_in = x.shape[1]
         output_height, output_width = output.shape[-2:]
-        channels_out = conv_module.conv.out_channels
-        kernel_height, kernel_width = conv_module.conv.kernel_size
-        groups = conv_module.conv.groups
+        channels_out = conv_module.out_channels
+        kernel_height, kernel_width = conv_module.kernel_size
+        groups = conv_module.groups
 
         total += (
             x.shape[0]
@@ -94,7 +116,7 @@ def count_macs(module: nn.Module, inputs: torch.Tensor) -> MacResult:
         )
 
     for child in module.modules():
-        if isinstance(child, Conv):
+        if isinstance(child, nn.Conv2d):
             hooks.append(child.register_forward_hook(count_conv))
         elif isinstance(child, nn.ConvTranspose2d):
             hooks.append(child.register_forward_hook(count_conv_transpose))
@@ -261,7 +283,7 @@ def main() -> None:
         print(f"GPU:        {torch.cuda.get_device_name(device)}")
     print(f"Dtype:      {dtype}")
     print(f"Input:      {tuple(inputs.shape)}")
-    print(f"Output:     {tuple(result.output.shape)}")
+    print(f"Output:     {format_output_shapes(result.output)}")
     print(f"Parameters: {parameters:,}")
     print(f"MACs:       {result.macs:,} ({result.macs / 1e9:.6f} GMACs)")
     print(f"GFLOPs:     {2 * result.macs / 1e9:.6f} (2 FLOPs per MAC)")
@@ -274,7 +296,7 @@ def main() -> None:
             stage_result = count_macs(stage, stage_input)
             print(
                 f"  {index}: {stage_result.macs / 1e6:10.3f} MMACs "
-                f"-> {tuple(stage_result.output.shape)}"
+                f"-> {format_output_shapes(stage_result.output)}"
             )
             stage_input = stage_result.output
     else:

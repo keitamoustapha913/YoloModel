@@ -7,6 +7,7 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from dataclasses import dataclass
+from typing import Sequence
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -1095,7 +1096,7 @@ class TransposeDecoderV3(nn.Module):
 
 
 class TransposeDecoderV4(nn.Module):
-    """Progressive 3x3 decoder with lightweight high-resolution stages."""
+    """Progressive 3x3 decoder with dense channel mixing at every stage."""
 
     def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
         super().__init__()
@@ -1105,7 +1106,7 @@ class TransposeDecoderV4(nn.Module):
             raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
         if output_spec.channels < latent_dim:
             raise ValueError(
-                "TransposeDecoderV3 requires output channels to be greater "
+                "TransposeDecoderV4 requires output channels to be greater "
                 f"than or equal to latent_dim, got {output_spec.channels} "
                 f"and {latent_dim}."
             )
@@ -1136,16 +1137,9 @@ class TransposeDecoderV4(nn.Module):
             layers.append(nn.ReLU(inplace=True))
 
         channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
-        grouped_stage_start = max(0, len(channel_pairs) - 2)
         for index, (in_channels, out_channels) in enumerate(channel_pairs):
-            # Keep low-resolution stages dense for complete channel mixing.
-            # Group only the two largest spatial stages, where dense 3x3
-            # transpose convolutions are disproportionately expensive.
-            groups = (
-                math.gcd(in_channels, out_channels)
-                if index >= grouped_stage_start
-                else 1
-            )
+            # V4 keeps every stage dense so each output channel can learn
+            # from every input channel, including at high resolutions.
             layers.append(
                 nn.ConvTranspose2d(
                     in_channels,
@@ -1154,7 +1148,7 @@ class TransposeDecoderV4(nn.Module):
                     stride=2,
                     padding=1,
                     output_padding=1,
-                    groups=groups,
+                    groups=1,
                     bias=True,
                 )
             )
@@ -1175,3 +1169,449 @@ class TransposeDecoderV4(nn.Module):
                 align_corners=False,
             )
         return output
+
+
+def is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+class ReconstructionResidualBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=1,
+            padding=dilation,
+            dilation=dilation,
+            bias=True,
+        )
+        self.conv2 = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=1,
+            padding=dilation,
+            dilation=dilation,
+            bias=True,
+        )
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        output = self.activation(self.conv1(inputs))
+        output = self.conv2(output)
+        return self.activation(inputs + output)
+
+
+class ReconstructionResidualBlockV2(nn.Module):
+    """Dense bottleneck residual block with a dilated spatial convolution."""
+
+    def __init__(
+        self,
+        channels: int,
+        dilation: int,
+        bottleneck_ratio: int = 4,
+    ) -> None:
+        super().__init__()
+        if channels < 1:
+            raise ValueError(f"channels must be positive, got {channels}.")
+        if dilation < 1:
+            raise ValueError(f"dilation must be positive, got {dilation}.")
+        if bottleneck_ratio < 1:
+            raise ValueError(
+                f"bottleneck_ratio must be positive, got {bottleneck_ratio}."
+            )
+
+        bottleneck_channels = max(1, channels // bottleneck_ratio)
+        self.bottleneck_channels = bottleneck_channels
+        self.reduce = nn.Conv2d(
+            channels,
+            bottleneck_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            bias=True,
+        )
+        self.spatial = nn.Conv2d(
+            bottleneck_channels,
+            bottleneck_channels,
+            kernel_size=3,
+            stride=1,
+            padding=dilation,
+            dilation=dilation,
+            groups=1,
+            bias=True,
+        )
+        self.expand = nn.Conv2d(
+            bottleneck_channels,
+            channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            bias=True,
+        )
+        self.activation = nn.ReLU(inplace=True)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        output = self.activation(self.reduce(inputs))
+        output = self.activation(self.spatial(output))
+        output = self.expand(output)
+        return self.activation(inputs + output)
+
+
+class LogicalReconstructionNetR2(nn.Module):
+    """
+    R2 replication.
+
+    The network shares an image stem and produces three progressively more
+    contextual feature stages (dilation 1, 2, 4), followed by level-specific
+    1x1 projections and exact spatial alignment to A's outputs.
+    """
+
+    @staticmethod
+    def _select_stem_ratio(image_size: int, largest_height: int) -> int:
+        if image_size % largest_height != 0:
+            raise ValueError("Teacher map size must divide the input image size.")
+
+        ratio = image_size // largest_height
+        if ratio < 1 or not is_power_of_two(ratio):
+            raise ValueError(
+                f"Input/map resolution ratio must be a power of two; received {ratio}."
+            )
+        return ratio
+
+    @staticmethod
+    def _build_stem_channels(hidden_channels: int, ratio: int) -> list[int]:
+        """Return the original fixed-width channel schedule for the R2 stem."""
+
+        num_downsampling_stages = int(math.log2(ratio))
+        return [hidden_channels] * max(1, num_downsampling_stages)
+
+    @staticmethod
+    def _select_stem_kernel_size(stride: int) -> int:
+        """Keep the original R2 stem on 3x3 convolutions."""
+
+        return 3
+
+    @staticmethod
+    def _build_residual_block(channels: int, dilation: int) -> nn.Module:
+        """Build the original full-width residual block."""
+
+        return ReconstructionResidualBlock(channels, dilation)
+
+    def __init__(
+        self,
+        image_size: int,
+        output_specs: Sequence[FeatureSpec],
+        hidden_channels: int = 128,
+    ) -> None:
+        super().__init__()
+        if len(output_specs) != 3:
+            raise ValueError("R2 requires exactly three output specifications.")
+        if hidden_channels < 1:
+            raise ValueError(
+                f"hidden_channels must be positive, got {hidden_channels}."
+            )
+        self.output_specs = tuple(output_specs)
+
+        largest_height = max(spec.height for spec in output_specs)
+        largest_width = max(spec.width for spec in output_specs)
+        if largest_height != largest_width:
+            raise ValueError("This replication expects square teacher maps.")
+        ratio = self._select_stem_ratio(image_size, largest_height)
+
+        stem_channels = self._build_stem_channels(hidden_channels, ratio)
+        stem_layers: list[nn.Module] = []
+        in_channels = 3
+        current_ratio = 1
+        for out_channels in stem_channels:
+            stride = 2 if current_ratio < ratio else 1
+            kernel_size = self._select_stem_kernel_size(stride)
+            stem_layers.extend(
+                [
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=kernel_size,
+                        stride=stride,
+                        padding=kernel_size // 2,
+                        groups=1,
+                        bias=True,
+                    ),
+                    nn.ReLU(inplace=True),
+                ]
+            )
+            in_channels = out_channels
+            current_ratio *= stride
+
+        self.stem = nn.Sequential(*stem_layers)
+        self.stage1 = self._build_residual_block(hidden_channels, dilation=1)
+        self.stage2 = self._build_residual_block(hidden_channels, dilation=2)
+        self.stage3 = self._build_residual_block(hidden_channels, dilation=4)
+        self.heads = nn.ModuleList(
+            [nn.Conv2d(hidden_channels, spec.channels, kernel_size=1) for spec in output_specs]
+        )
+
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        base = self.stem(image)
+        stages = (
+            self.stage1(base),
+            None,
+            None,
+        )
+        level1 = stages[0]
+        level2 = self.stage2(level1)
+        level3 = self.stage3(level2)
+        stage_outputs = (level1, level2, level3)
+
+        outputs: list[Tensor] = []
+        for stage, head, spec in zip(stage_outputs, self.heads, self.output_specs):
+            output = head(stage)
+            target_size = (spec.height, spec.width)
+            if output.shape[-2:] != target_size:
+                output = F.interpolate(output, size=target_size, mode="bilinear", align_corners=False)
+            outputs.append(output)
+        return tuple(outputs)  # type: ignore[return-value]
+
+
+class LogicalReconstructionNetR2V2(LogicalReconstructionNetR2):
+    """Hierarchical R2 variant with three progressively downsampled stages."""
+
+    def __init__(
+        self,
+        image_size: int,
+        output_specs: Sequence[FeatureSpec],
+        hidden_channels: int = 128,
+    ) -> None:
+        nn.Module.__init__(self)
+        if len(output_specs) != 3:
+            raise ValueError("R2 V2 requires exactly three output specifications.")
+        if image_size < 32:
+            raise ValueError(
+                "image_size must support five stride-2 reductions, "
+                f"got {image_size}."
+            )
+        if hidden_channels < 32:
+            raise ValueError(
+                "hidden_channels must be at least 32 for the progressive "
+                f"stage schedule, got {hidden_channels}."
+            )
+
+        self.output_specs = tuple(output_specs)
+        first_stage_channels = hidden_channels // 4
+        stage_channels = _build_progressive_stage_channels(
+            latent_dim=first_stage_channels,
+            output_channels=hidden_channels,
+            num_stages=3,
+        )
+        self.stage_channels = tuple(stage_channels)
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, 8, kernel_size=3, stride=2, padding=1, groups=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, stride=2, padding=1, groups=1),
+            nn.ReLU(inplace=True),
+        )
+
+        stages: list[nn.Module] = []
+        in_channels = 16
+        for out_channels, dilation in zip(stage_channels, (1, 2, 4)):
+            stages.append(
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        groups=1,
+                        bias=True,
+                    ),
+                    nn.ReLU(inplace=True),
+                    self._build_residual_block(out_channels, dilation),
+                )
+            )
+            in_channels = out_channels
+
+        self.stage1, self.stage2, self.stage3 = stages
+        self.heads = nn.ModuleList(
+            [
+                nn.Conv2d(channels, spec.channels, kernel_size=1, groups=1)
+                for channels, spec in zip(stage_channels, output_specs)
+            ]
+        )
+
+    @staticmethod
+    def _build_residual_block(channels: int, dilation: int) -> nn.Module:
+        """Build the four-times-narrower dense bottleneck residual block."""
+
+        return ReconstructionResidualBlockV2(
+            channels=channels,
+            dilation=dilation,
+            bottleneck_ratio=4,
+        )
+
+
+class LogicalReconstructionNetR2V3(nn.Module):
+    """Independent hierarchical reconstruction network.
+
+    V3 follows the efficient spatial hierarchy introduced by V2, but it is a
+    standalone ``nn.Module`` rather than a subclass of R2 or R2V2. For the
+    default 640x640 input and 128 hidden channels, its feature path is::
+
+        RGB input       [B,   3, 640, 640]
+        stem output     [B,  16, 160, 160]
+        stage 1 output  [B,  32,  80,  80]
+        stage 2 output  [B,  64,  40,  40]
+        stage 3 output  [B, 128,  20,  20]
+
+    Each stage starts with a dense 3x3 stride-2 convolution and then applies a
+    bottleneck ``ReconstructionResidualBlockV2``. A dense 1x1 head projects
+    each stage to its requested channel count, and bilinear interpolation
+    aligns it to the requested spatial dimensions.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        output_specs: Sequence[FeatureSpec],
+        hidden_channels: int = 128,
+        bottleneck_ratio: int = 4,
+    ) -> None:
+        super().__init__()
+        if image_size < 32 or image_size % 32 != 0:
+            raise ValueError(
+                "image_size must be a positive multiple of 32, "
+                f"got {image_size}."
+            )
+        if len(output_specs) != 3:
+            raise ValueError("R2 V3 requires exactly three output specifications.")
+        if hidden_channels < 32 or hidden_channels % 4 != 0:
+            raise ValueError(
+                "hidden_channels must be at least 32 and divisible by 4, "
+                f"got {hidden_channels}."
+            )
+        if bottleneck_ratio < 1:
+            raise ValueError(
+                f"bottleneck_ratio must be positive, got {bottleneck_ratio}."
+            )
+        if any(
+            spec.channels < 1 or spec.height < 1 or spec.width < 1
+            for spec in output_specs
+        ):
+            raise ValueError("All output feature dimensions must be positive.")
+
+        self.image_size = image_size
+        self.output_specs = tuple(output_specs)
+        self.stage_channels = (
+            hidden_channels // 4,
+            hidden_channels // 2,
+            hidden_channels,
+        )
+
+        # Two inexpensive spatial reductions produce the shared 160x160 map.
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                3,
+                8,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                groups=1,
+                bias=True,
+            ),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(
+                8,
+                16,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                groups=1,
+                bias=True,
+            ),
+            nn.ReLU(inplace=True),
+        )
+
+        # Channel width doubles while spatial extent halves at every stage.
+        stage_inputs = (16, *self.stage_channels[:-1])
+        dilations = (1, 2, 4)
+        self.stages = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        groups=1,
+                        bias=True,
+                    ),
+                    nn.ReLU(inplace=True),
+                    ReconstructionResidualBlockV2(
+                        channels=out_channels,
+                        dilation=dilation,
+                        bottleneck_ratio=bottleneck_ratio,
+                    ),
+                )
+                for in_channels, out_channels, dilation in zip(
+                    stage_inputs,
+                    self.stage_channels,
+                    dilations,
+                )
+            ]
+        )
+
+        # One head corresponds to each stage and each output specification.
+        self.heads = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    stage_channels,
+                    spec.channels,
+                    kernel_size=1,
+                    groups=1,
+                    bias=True,
+                )
+                for stage_channels, spec in zip(
+                    self.stage_channels,
+                    self.output_specs,
+                )
+            ]
+        )
+
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        expected_size = (self.image_size, self.image_size)
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(
+                "Expected an RGB image tensor shaped [B, 3, H, W], "
+                f"got {tuple(image.shape)}."
+            )
+        if image.shape[-2:] != expected_size:
+            raise ValueError(
+                f"Expected spatial size {expected_size}, got {image.shape[-2:]}."
+            )
+
+        features: list[Tensor] = []
+        feature = self.stem(image)
+        for stage in self.stages:
+            feature = stage(feature)
+            features.append(feature)
+
+        outputs: list[Tensor] = []
+        for feature, head, spec in zip(features, self.heads, self.output_specs):
+            output = head(feature)
+            target_size = (spec.height, spec.width)
+            if output.shape[-2:] != target_size:
+                output = F.interpolate(
+                    output,
+                    size=target_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            outputs.append(output)
+
+        return outputs[0], outputs[1], outputs[2]
