@@ -591,7 +591,32 @@ class YOLOv11BackboneVariantV30(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
 class YOLOv11BackboneVariantV31(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=128,
+            width=128,
+        )
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, self.latent_dim, 3, 2),
+            PSABlock(self.latent_dim, 0.5, 4, True),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV32(nn.Module):
     def __init__(self, in_channels=3):
         super().__init__()
         self.feature_spec = FeatureSpec(
