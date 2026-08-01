@@ -1618,7 +1618,7 @@ class LogicalReconstructionNetR2V3(nn.Module):
 
 
 class LogicalReconstructionNetR2V4(nn.Module):
-    """Sub-0.5-ms reconstruction network with a learned feature hierarchy.
+    """Sub-0.5-ms reconstruction with native-resolution stage outputs.
 
     A dense 16x16 patch stem performs the expensive spatial reduction in one
     CUDA operation. Three dense 3x3 stages then grow channels while halving the
@@ -1629,11 +1629,10 @@ class LogicalReconstructionNetR2V4(nn.Module):
         stage 2  [B,  64, 10, 10]
         stage 3  [B, 128,  5,  5]
 
-    One groups=1 projection creates all three output channel groups from the
-    deepest hierarchical feature. A single bilinear resize materializes the
-    fused output, and channel views expose the three requested tensors. This
-    avoids separate head and resize launches while retaining learned stem and
-    multistage processing. No dilated convolution is used.
+    Each stage has its own groups=1 pointwise head and returns its native
+    spatial resolution. No interpolation, transposed convolution, dilation, or
+    shared deepest-feature projection is used. This preserves true
+    level-specific outputs while avoiding expensive spatial reconstruction.
     """
 
     def __init__(
@@ -1661,17 +1660,23 @@ class LogicalReconstructionNetR2V4(nn.Module):
         ):
             raise ValueError("All output feature dimensions must be positive.")
 
-        target_sizes = {(spec.height, spec.width) for spec in output_specs}
-        if len(target_sizes) != 1:
-            raise ValueError(
-                "R2 V4 requires all outputs to share one spatial size so the "
-                "expensive resize can be performed once."
-            )
+        native_sizes = (
+            (image_size // 32, image_size // 32),
+            (image_size // 64, image_size // 64),
+            (image_size // 128, image_size // 128),
+        )
+        for index, (spec, native_size) in enumerate(
+            zip(output_specs, native_sizes),
+            start=1,
+        ):
+            if (spec.height, spec.width) != native_size:
+                raise ValueError(
+                    f"R2 V4 output {index} must use its native stage size "
+                    f"{native_size}, got {(spec.height, spec.width)}."
+                )
 
         self.image_size = image_size
         self.output_specs = tuple(output_specs)
-        self.target_size = next(iter(target_sizes))
-        self.output_channels = tuple(spec.channels for spec in output_specs)
         stem_channels = hidden_channels // 8
         self.stage_channels = (
             hidden_channels // 4,
@@ -1715,14 +1720,22 @@ class LogicalReconstructionNetR2V4(nn.Module):
             ]
         )
 
-        self.output_projection = nn.Conv2d(
-            hidden_channels,
-            sum(self.output_channels),
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            groups=1,
-            bias=True,
+        self.heads = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    stage_channels,
+                    spec.channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    groups=1,
+                    bias=True,
+                )
+                for stage_channels, spec in zip(
+                    self.stage_channels,
+                    self.output_specs,
+                )
+            ]
         )
 
     def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
@@ -1738,16 +1751,106 @@ class LogicalReconstructionNetR2V4(nn.Module):
             )
 
         feature = self.stem(image)
-        for stage in self.stages:
+        outputs: list[Tensor] = []
+        for stage, head in zip(self.stages, self.heads):
             feature = stage(feature)
+            outputs.append(head(feature))
 
-        output = self.output_projection(feature)
-        if output.shape[-2:] != self.target_size:
-            output = F.interpolate(
-                output,
-                size=self.target_size,
-                mode="bilinear",
-                align_corners=False,
+        return outputs[0], outputs[1], outputs[2]
+
+
+class LogicalReconstructionNetR2V5(nn.Module):
+    """Native-resolution reconstruction from a compact sequential encoder.
+
+    For a 640x640 input, the encoder and selected stage outputs are::
+
+        Conv(3,  8, 3, 4) -> [B,  8, 160, 160]
+        Conv(8, 16, 3, 2) -> [B, 16,  80,  80]  stage 1
+        Conv(16,32, 3, 2) -> [B, 32,  40,  40]  stage 2
+        Conv(32,64, 3, 2) -> [B, 64,  20,  20]  stage 3
+
+    Each selected stage has an independent dense 1x1 output head. Outputs stay
+    at their native resolutions, so the network performs no interpolation,
+    transposed convolution, or dilated convolution.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        output_specs: Sequence[FeatureSpec],
+    ) -> None:
+        super().__init__()
+        if image_size < 32 or image_size % 32 != 0:
+            raise ValueError(
+                "image_size must be a positive multiple of 32, "
+                f"got {image_size}."
             )
-        outputs = output.split(self.output_channels, dim=1)
+        if len(output_specs) != 3:
+            raise ValueError("R2 V5 requires exactly three output specifications.")
+        if any(
+            spec.channels < 1 or spec.height < 1 or spec.width < 1
+            for spec in output_specs
+        ):
+            raise ValueError("All output feature dimensions must be positive.")
+
+        native_sizes = (
+            (image_size // 8, image_size // 8),
+            (image_size // 16, image_size // 16),
+            (image_size // 32, image_size // 32),
+        )
+        for index, (spec, native_size) in enumerate(
+            zip(output_specs, native_sizes),
+            start=1,
+        ):
+            if (spec.height, spec.width) != native_size:
+                raise ValueError(
+                    f"R2 V5 output {index} must use its native stage size "
+                    f"{native_size}, got {(spec.height, spec.width)}."
+                )
+
+        self.image_size = image_size
+        self.output_specs = tuple(output_specs)
+        self.encoder = nn.Sequential(
+            Conv(3, 8, 3, 4),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+        )
+        self.heads = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    stage_channels,
+                    spec.channels,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                    groups=1,
+                    bias=True,
+                )
+                for stage_channels, spec in zip(
+                    (16, 32, 64),
+                    self.output_specs,
+                )
+            ]
+        )
+
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        expected_size = (self.image_size, self.image_size)
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(
+                "Expected an RGB image tensor shaped [B, 3, H, W], "
+                f"got {tuple(image.shape)}."
+            )
+        if image.shape[-2:] != expected_size:
+            raise ValueError(
+                f"Expected spatial size {expected_size}, got {image.shape[-2:]}."
+            )
+
+        outputs: list[Tensor] = []
+        feature = image
+        for index, layer in enumerate(self.encoder):
+            feature = layer(feature)
+            if index > 0:
+                outputs.append(self.heads[index - 1](feature))
+
         return outputs[0], outputs[1], outputs[2]

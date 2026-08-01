@@ -26,6 +26,7 @@ from modules import (
     LogicalReconstructionNetR2V2,
     LogicalReconstructionNetR2V3,
     LogicalReconstructionNetR2V4,
+    LogicalReconstructionNetR2V5,
 )
 
 
@@ -696,12 +697,12 @@ class YOLOv11BackboneVariantV35(nn.Module):
     def __init__(self, in_channels=3):
         super().__init__()
         output_specs = [
-            FeatureSpec(128, 128, 128),
-            FeatureSpec(128, 128, 128),
-            FeatureSpec(128, 128, 128),
+            FeatureSpec(128, 20, 20),
+            FeatureSpec(128, 10, 10),
+            FeatureSpec(128, 5, 5),
         ]
 
-        image_size = 256
+        image_size = 640
 
         self.model = nn.Sequential(
             LogicalReconstructionNetR2V4(
@@ -713,6 +714,68 @@ class YOLOv11BackboneVariantV35(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
+class YOLOv11BackboneVariantV36(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 4),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV37(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        output_specs = [
+            FeatureSpec(128, 80, 80),
+            FeatureSpec(128, 40, 40),
+            FeatureSpec(128, 20, 20),
+        ]
+
+        image_size = 640
+
+        self.model = nn.Sequential(
+            LogicalReconstructionNetR2V5(
+                image_size=image_size,
+                output_specs=output_specs,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV38(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        output_specs = [
+            FeatureSpec(128, 32, 32),
+            FeatureSpec(128, 16, 16),
+            FeatureSpec(128, 8, 8),
+        ]
+
+        image_size = 256
+
+        self.model = nn.Sequential(
+            LogicalReconstructionNetR2V5(
+                image_size=image_size,
+                output_specs=output_specs,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
 
 
 def parse_args() -> argparse.Namespace:
