@@ -1111,7 +1111,7 @@ class TransposeDecoderV4(nn.Module):
             )
 
         target_extent = max(output_spec.height, output_spec.width)
-        generated_extent = max(4, math.ceil(math.log2(target_extent)))
+        generated_extent = max(4, 2 ** math.ceil(math.log2(target_extent)))
         num_spatial_stages = int(math.log2(generated_extent)) - 1
         stage_channels = _build_progressive_stage_channels(
             latent_dim=latent_dim,
