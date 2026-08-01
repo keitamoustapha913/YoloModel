@@ -55,8 +55,8 @@ For a 640×640 input with batch size 1, the backbone produces a `(1, 256, 20,
 
 ```text
 Parameters: 1,200,864
-MACs:       3.740518 GMACs
-GFLOPs:     7.481037
+MACs:       1.484442 GMACs
+GFLOPs:     2.968883
 ```
 
 Inference speed depends on the hardware, precision, input size, and batch size.

@@ -7,9 +7,10 @@ Examples:
     uv run python profile_backbone.py --device cuda --dtype fp16
     uv run python profile_backbone.py --height 640 --width 640 --iterations 200
 
-MAC counting includes convolution MACs and the matrix multiplications in the
-PSA attention blocks. Elementwise operations, batch normalization, activation,
-softmax, concatenation, and tensor reshaping are not included in the MAC total.
+MAC counting includes convolution and transposed-convolution MACs, plus the
+matrix multiplications in the PSA attention blocks. Elementwise operations,
+batch normalization, activation, softmax, pooling, interpolation,
+concatenation, and tensor reshaping are not included in the MAC total.
 """
 
 from __future__ import annotations
@@ -33,23 +34,24 @@ class MacResult:
 
 
 def count_macs(module: nn.Module, inputs: torch.Tensor) -> MacResult:
-    """Count convolution and attention matrix-multiplication MACs."""
+    """Count convolution, transposed-convolution, and attention MACs."""
 
     total = 0
     hooks = []
 
-    def count_conv(conv_module: Conv, hook_inputs, _output) -> None:
+    def count_conv(conv_module: Conv, hook_inputs, output) -> None:
         nonlocal total
         x = hook_inputs[0]
-        _, channels_in, height, width = x.shape
+        channels_in = x.shape[1]
+        output_height, output_width = output.shape[-2:]
         channels_out = conv_module.conv.out_channels
         kernel_height, kernel_width = conv_module.conv.kernel_size
         groups = conv_module.conv.groups
 
         total += (
             x.shape[0]
-            * height
-            * width
+            * output_height
+            * output_width
             * channels_out
             * (channels_in // groups)
             * kernel_height
@@ -72,9 +74,30 @@ def count_macs(module: nn.Module, inputs: torch.Tensor) -> MacResult:
             * (attention_module.key_dim + attention_module.head_dim)
         )
 
+    def count_conv_transpose(
+        conv_module: nn.ConvTranspose2d, hook_inputs, _output
+    ) -> None:
+        nonlocal total
+        x = hook_inputs[0]
+        kernel_height, kernel_width = conv_module.kernel_size
+
+        # Every input position expands through the transposed-convolution
+        # kernel into out_channels / groups output channels.
+        total += (
+            x.shape[0]
+            * x.shape[-2]
+            * x.shape[-1]
+            * conv_module.in_channels
+            * (conv_module.out_channels // conv_module.groups)
+            * kernel_height
+            * kernel_width
+        )
+
     for child in module.modules():
         if isinstance(child, Conv):
             hooks.append(child.register_forward_hook(count_conv))
+        elif isinstance(child, nn.ConvTranspose2d):
+            hooks.append(child.register_forward_hook(count_conv_transpose))
         elif isinstance(child, Attention):
             hooks.append(child.register_forward_hook(count_attention))
 

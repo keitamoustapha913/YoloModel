@@ -4,7 +4,9 @@ import math
 
 import numpy as np
 import torch
-from torch import nn
+from torch import nn, Tensor
+import torch.nn.functional as F
+from dataclasses import dataclass
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -788,3 +790,260 @@ class PatchStridedBackbone(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+
+
+
+###########################################
+
+@dataclass(frozen=True)
+class FeatureSpec:
+    channels: int
+    height: int
+    width: int
+
+
+
+class TransposeDecoder(nn.Module):
+    """Decode [B, Z, 1, 1] into one requested teacher-map shape."""
+
+    def __init__(
+        self,
+        latent_dim: int,
+        output_spec: FeatureSpec,
+        base_channels: int = 32,
+        max_channels: int = 256,
+    ) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        target_extent = max(output_spec.height, output_spec.width)
+        generated_extent = max(4, 2 ** math.ceil(math.log2(target_extent)))
+
+        layers: list[nn.Module] = []
+        current_extent = 1
+        in_channels = latent_dim
+        hidden_channels = max_channels
+
+        # 1x1 -> 4x4
+        is_final = generated_extent == 4
+        first_out = output_spec.channels if is_final else hidden_channels
+        layers.append(
+            nn.ConvTranspose2d(
+                in_channels,
+                first_out,
+                kernel_size=4,
+                stride=1,
+                padding=0,
+                bias=True,
+            )
+        )
+        current_extent = 4
+        if not is_final:
+            layers.append(nn.ReLU(inplace=True))
+        in_channels = first_out
+
+        while current_extent < generated_extent:
+            next_extent = current_extent * 2
+            is_final = next_extent == generated_extent
+            if is_final:
+                out_channels = output_spec.channels
+            else:
+                hidden_channels = max(base_channels, hidden_channels // 2)
+                out_channels = hidden_channels
+
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=4,
+                    stride=2,
+                    padding=1,
+                    bias=True,
+                )
+            )
+            if not is_final:
+                layers.append(nn.ReLU(inplace=True))
+            in_channels = out_channels
+            current_extent = next_extent
+
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        output = self.network(latent)
+        target_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != target_size:
+            output = F.interpolate(output, size=target_size, mode="bilinear", align_corners=False)
+        return output
+
+
+class TransposeDecoderV2(nn.Module):
+    """Progressively grow spatial resolution and channels from a latent map."""
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels < latent_dim:
+            raise ValueError(
+                "TransposeDecoderV2 requires output channels to be greater "
+                f"than or equal to latent_dim, got {output_spec.channels} "
+                f"and {latent_dim}."
+            )
+
+        target_extent = max(output_spec.height, output_spec.width)
+        generated_extent = max(4, 2 ** math.ceil(math.log2(target_extent)))
+        num_spatial_stages = int(math.log2(generated_extent)) - 1
+        stage_channels = self._build_stage_channels(
+            latent_dim=latent_dim,
+            output_channels=output_spec.channels,
+            num_stages=num_spatial_stages,
+        )
+
+        layers: list[nn.Module] = [
+            nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=4,
+                stride=1,
+                padding=0,
+                bias=True,
+            )
+        ]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        for index, (in_channels, out_channels) in enumerate(
+            zip(stage_channels[:-1], stage_channels[1:])
+        ):
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=2,
+                    stride=2,
+                    padding=0,
+                    bias=True,
+                )
+            )
+            if index < len(stage_channels) - 2:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.stage_channels = tuple(stage_channels)
+        self.network = nn.Sequential(*layers)
+
+    @staticmethod
+    def _build_stage_channels(
+        latent_dim: int,
+        output_channels: int,
+        num_stages: int,
+    ) -> list[int]:
+        """Build a non-decreasing channel schedule ending at the target."""
+        if num_stages == 1:
+            return [output_channels]
+
+        growth_levels = math.ceil(math.log2(output_channels / latent_dim))
+        channels = []
+        for stage_index in range(num_stages):
+            level = math.floor(
+                stage_index * growth_levels / (num_stages - 1)
+            )
+            channels.append(min(output_channels, latent_dim * (2**level)))
+        channels[-1] = output_channels
+        return channels
+
+    def forward(self, latent: Tensor) -> Tensor:
+        output = self.network(latent)
+        target_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != target_size:
+            output = F.interpolate(
+                output,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return output
+
+
+class TransposeDecoderV3(nn.Module):
+    """Progressive 3x3 decoder with lightweight high-resolution stages."""
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels < latent_dim:
+            raise ValueError(
+                "TransposeDecoderV3 requires output channels to be greater "
+                f"than or equal to latent_dim, got {output_spec.channels} "
+                f"and {latent_dim}."
+            )
+
+        target_extent = max(output_spec.height, output_spec.width)
+        generated_extent = max(4, 2 ** math.ceil(math.log2(target_extent)))
+        num_spatial_stages = int(math.log2(generated_extent)) - 1
+        stage_channels = TransposeDecoderV2._build_stage_channels(
+            latent_dim=latent_dim,
+            output_channels=output_spec.channels,
+            num_stages=num_spatial_stages,
+        )
+
+        # A 3x3 transpose convolution with stride 2 and output_padding 1
+        # expands the 1x1 latent map directly to 4x4.
+        layers: list[nn.Module] = [
+            nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                bias=True,
+            )
+        ]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        grouped_stage_start = max(0, len(channel_pairs) - 2)
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            # Keep low-resolution stages dense for complete channel mixing.
+            # Group only the two largest spatial stages, where dense 3x3
+            # transpose convolutions are disproportionately expensive.
+            groups = (
+                math.gcd(in_channels, out_channels)
+                if index >= grouped_stage_start
+                else 1
+            )
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=groups,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.stage_channels = tuple(stage_channels)
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        output = self.network(latent)
+        target_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != target_size:
+            output = F.interpolate(
+                output,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return output
