@@ -32,7 +32,9 @@ from yolov11_backbone_variant import (
     YOLOv11BackboneVariantV30,
     YOLOv11BackboneVariantV31,
     YOLOv11BackboneVariantV32,
-    YOLOv11BackboneVariantV33
+    YOLOv11BackboneVariantV33,
+    YOLOv11BackboneVariantV34,
+    YOLOv11BackboneVariantV35,
 )
 
 from modules import PatchStridedBackbone

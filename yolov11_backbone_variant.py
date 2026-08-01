@@ -23,7 +23,9 @@ from modules import (
     TransposeDecoderV2,
     TransposeDecoderV3,
     TransposeDecoderV4,
-    LogicalReconstructionNetR2V2
+    LogicalReconstructionNetR2V2,
+    LogicalReconstructionNetR2V3,
+    LogicalReconstructionNetR2V4,
 )
 
 
@@ -665,6 +667,52 @@ class YOLOv11BackboneVariantV33(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV34(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        output_specs = [
+            FeatureSpec(128, 128, 128),
+            FeatureSpec(128, 128, 128),
+            FeatureSpec(128, 128, 128),
+        ]
+
+        image_size = 640
+
+        self.model = nn.Sequential(
+            LogicalReconstructionNetR2V3(
+                image_size=image_size,
+                output_specs=output_specs,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV35(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        output_specs = [
+            FeatureSpec(128, 128, 128),
+            FeatureSpec(128, 128, 128),
+            FeatureSpec(128, 128, 128),
+        ]
+
+        image_size = 256
+
+        self.model = nn.Sequential(
+            LogicalReconstructionNetR2V4(
+                image_size=image_size,
+                output_specs=output_specs,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
 
 
 def parse_args() -> argparse.Namespace:

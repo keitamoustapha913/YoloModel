@@ -1615,3 +1615,139 @@ class LogicalReconstructionNetR2V3(nn.Module):
             outputs.append(output)
 
         return outputs[0], outputs[1], outputs[2]
+
+
+class LogicalReconstructionNetR2V4(nn.Module):
+    """Sub-0.5-ms reconstruction network with a learned feature hierarchy.
+
+    A dense 16x16 patch stem performs the expensive spatial reduction in one
+    CUDA operation. Three dense 3x3 stages then grow channels while halving the
+    feature map. For a 640x640 image and 128 hidden channels, the path is::
+
+        stem     [B,  16, 40, 40]
+        stage 1  [B,  32, 20, 20]
+        stage 2  [B,  64, 10, 10]
+        stage 3  [B, 128,  5,  5]
+
+    One groups=1 projection creates all three output channel groups from the
+    deepest hierarchical feature. A single bilinear resize materializes the
+    fused output, and channel views expose the three requested tensors. This
+    avoids separate head and resize launches while retaining learned stem and
+    multistage processing. No dilated convolution is used.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        output_specs: Sequence[FeatureSpec],
+        hidden_channels: int = 128,
+    ) -> None:
+        super().__init__()
+        if image_size < 128 or image_size % 128 != 0:
+            raise ValueError(
+                "image_size must be a positive multiple of 128, "
+                f"got {image_size}."
+            )
+        if len(output_specs) != 3:
+            raise ValueError("R2 V4 requires exactly three output specifications.")
+        if hidden_channels < 8 or hidden_channels % 8 != 0:
+            raise ValueError(
+                "hidden_channels must be at least 8 and divisible by 8, "
+                f"got {hidden_channels}."
+            )
+        if any(
+            spec.channels < 1 or spec.height < 1 or spec.width < 1
+            for spec in output_specs
+        ):
+            raise ValueError("All output feature dimensions must be positive.")
+
+        target_sizes = {(spec.height, spec.width) for spec in output_specs}
+        if len(target_sizes) != 1:
+            raise ValueError(
+                "R2 V4 requires all outputs to share one spatial size so the "
+                "expensive resize can be performed once."
+            )
+
+        self.image_size = image_size
+        self.output_specs = tuple(output_specs)
+        self.target_size = next(iter(target_sizes))
+        self.output_channels = tuple(spec.channels for spec in output_specs)
+        stem_channels = hidden_channels // 8
+        self.stage_channels = (
+            hidden_channels // 4,
+            hidden_channels // 2,
+            hidden_channels,
+        )
+
+        # Non-overlapping learned patches cover the complete input exactly.
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                3,
+                stem_channels,
+                kernel_size=16,
+                stride=16,
+                padding=0,
+                groups=1,
+                bias=True,
+            ),
+            nn.ReLU(inplace=True),
+        )
+
+        stage_inputs = (stem_channels, *self.stage_channels[:-1])
+        self.stages = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(
+                        in_channels,
+                        out_channels,
+                        kernel_size=3,
+                        stride=2,
+                        padding=1,
+                        groups=1,
+                        bias=True,
+                    ),
+                    nn.ReLU(inplace=True),
+                )
+                for in_channels, out_channels in zip(
+                    stage_inputs,
+                    self.stage_channels,
+                )
+            ]
+        )
+
+        self.output_projection = nn.Conv2d(
+            hidden_channels,
+            sum(self.output_channels),
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            bias=True,
+        )
+
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        expected_size = (self.image_size, self.image_size)
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(
+                "Expected an RGB image tensor shaped [B, 3, H, W], "
+                f"got {tuple(image.shape)}."
+            )
+        if image.shape[-2:] != expected_size:
+            raise ValueError(
+                f"Expected spatial size {expected_size}, got {image.shape[-2:]}."
+            )
+
+        feature = self.stem(image)
+        for stage in self.stages:
+            feature = stage(feature)
+
+        output = self.output_projection(feature)
+        if output.shape[-2:] != self.target_size:
+            output = F.interpolate(
+                output,
+                size=self.target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        outputs = output.split(self.output_channels, dim=1)
+        return outputs[0], outputs[1], outputs[2]
