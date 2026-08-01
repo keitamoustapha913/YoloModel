@@ -802,6 +802,71 @@ class FeatureSpec:
     width: int
 
 
+def _build_progressive_stage_channels(
+    latent_dim: int,
+    output_channels: int,
+    num_stages: int,
+) -> list[int]:
+    """Create a gradual channel schedule for progressive decoder stages.
+
+    Each entry describes the output-channel count of one spatial decoder
+    stage. The schedule begins at ``latent_dim``, grows by powers of two, and
+    finishes at exactly ``output_channels``. Growth levels are distributed as
+    evenly as possible across ``num_stages``; repeated channel counts are
+    intentional because they avoid increasing channel width too early at
+    expensive spatial resolutions.
+
+    This helper only constructs model configuration during ``__init__``. It
+    does not process tensors and adds no inference-time operations.
+
+    Args:
+        latent_dim: Number of channels in the latent input. Must be positive.
+        output_channels: Required channels in the final decoder output. It
+            must be greater than or equal to ``latent_dim``.
+        num_stages: Number of spatial decoder stages, including the initial
+            stage that generates the first feature map. Must be positive.
+
+    Returns:
+        A list of ``num_stages`` non-decreasing channel counts. Its final
+        entry is always exactly ``output_channels``.
+
+    Raises:
+        ValueError: If a dimension is non-positive or if ``output_channels``
+            is smaller than ``latent_dim``.
+
+    Example:
+        A six-stage decoder growing from 32 latent channels to 128 output
+        channels receives the following schedule:
+
+        >>> _build_progressive_stage_channels(32, 128, 6)
+        [32, 32, 32, 64, 64, 128]
+    """
+    if latent_dim < 1:
+        raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+    if output_channels < latent_dim:
+        raise ValueError(
+            "output_channels must be greater than or equal to latent_dim, "
+            f"got {output_channels} and {latent_dim}."
+        )
+    if num_stages < 1:
+        raise ValueError(f"num_stages must be positive, got {num_stages}.")
+    if num_stages == 1:
+        return [output_channels]
+
+    # Number of channel doublings needed to reach or pass the target width.
+    growth_levels = math.ceil(math.log2(output_channels / latent_dim))
+    channels: list[int] = []
+    for stage_index in range(num_stages):
+        # Map the spatial stage onto a channel-growth level. Using floor keeps
+        # channels narrow until the next complete growth level is reached.
+        level = math.floor(stage_index * growth_levels / (num_stages - 1))
+        channels.append(min(output_channels, latent_dim * (2**level)))
+
+    # Handle non-power-of-two targets such as 96 channels exactly.
+    channels[-1] = output_channels
+    return channels
+
+
 
 class TransposeDecoder(nn.Module):
     """Decode [B, Z, 1, 1] into one requested teacher-map shape."""
@@ -874,8 +939,6 @@ class TransposeDecoder(nn.Module):
         if output.shape[-2:] != target_size:
             output = F.interpolate(output, size=target_size, mode="bilinear", align_corners=False)
         return output
-
-
 class TransposeDecoderV2(nn.Module):
     """Progressively grow spatial resolution and channels from a latent map."""
 
@@ -895,7 +958,7 @@ class TransposeDecoderV2(nn.Module):
         target_extent = max(output_spec.height, output_spec.width)
         generated_extent = max(4, 2 ** math.ceil(math.log2(target_extent)))
         num_spatial_stages = int(math.log2(generated_extent)) - 1
-        stage_channels = self._build_stage_channels(
+        stage_channels = _build_progressive_stage_channels(
             latent_dim=latent_dim,
             output_channels=output_spec.channels,
             num_stages=num_spatial_stages,
@@ -933,26 +996,6 @@ class TransposeDecoderV2(nn.Module):
         self.stage_channels = tuple(stage_channels)
         self.network = nn.Sequential(*layers)
 
-    @staticmethod
-    def _build_stage_channels(
-        latent_dim: int,
-        output_channels: int,
-        num_stages: int,
-    ) -> list[int]:
-        """Build a non-decreasing channel schedule ending at the target."""
-        if num_stages == 1:
-            return [output_channels]
-
-        growth_levels = math.ceil(math.log2(output_channels / latent_dim))
-        channels = []
-        for stage_index in range(num_stages):
-            level = math.floor(
-                stage_index * growth_levels / (num_stages - 1)
-            )
-            channels.append(min(output_channels, latent_dim * (2**level)))
-        channels[-1] = output_channels
-        return channels
-
     def forward(self, latent: Tensor) -> Tensor:
         output = self.network(latent)
         target_size = (self.output_spec.height, self.output_spec.width)
@@ -985,7 +1028,92 @@ class TransposeDecoderV3(nn.Module):
         target_extent = max(output_spec.height, output_spec.width)
         generated_extent = max(4, 2 ** math.ceil(math.log2(target_extent)))
         num_spatial_stages = int(math.log2(generated_extent)) - 1
-        stage_channels = TransposeDecoderV2._build_stage_channels(
+        stage_channels = _build_progressive_stage_channels(
+            latent_dim=latent_dim,
+            output_channels=output_spec.channels,
+            num_stages=num_spatial_stages,
+        )
+
+        # A 3x3 transpose convolution with stride 2 and output_padding 1
+        # expands the 1x1 latent map directly to 4x4.
+        layers: list[nn.Module] = [
+            nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                bias=True,
+            )
+        ]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        grouped_stage_start = max(0, len(channel_pairs) - 2)
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            # Keep low-resolution stages dense for complete channel mixing.
+            # Group only the two largest spatial stages, where dense 3x3
+            # transpose convolutions are disproportionately expensive.
+            groups = (
+                math.gcd(in_channels, out_channels)
+                if index >= grouped_stage_start
+                else 1
+            )
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=groups,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.stage_channels = tuple(stage_channels)
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        output = self.network(latent)
+        target_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != target_size:
+            output = F.interpolate(
+                output,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return output
+
+
+
+
+class TransposeDecoderV4(nn.Module):
+    """Progressive 3x3 decoder with lightweight high-resolution stages."""
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels < latent_dim:
+            raise ValueError(
+                "TransposeDecoderV3 requires output channels to be greater "
+                f"than or equal to latent_dim, got {output_spec.channels} "
+                f"and {latent_dim}."
+            )
+
+        target_extent = max(output_spec.height, output_spec.width)
+        generated_extent = max(4, math.ceil(math.log2(target_extent)))
+        num_spatial_stages = int(math.log2(generated_extent)) - 1
+        stage_channels = _build_progressive_stage_channels(
             latent_dim=latent_dim,
             output_channels=output_spec.channels,
             num_stages=num_spatial_stages,

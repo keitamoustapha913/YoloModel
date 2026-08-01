@@ -22,6 +22,7 @@ from modules import (
     PSABlock,
     TransposeDecoderV2,
     TransposeDecoderV3,
+    TransposeDecoderV4,
 )
 
 
@@ -501,6 +502,121 @@ class YOLOv11BackboneVariantV27(nn.Module):
     def forward(self, x):
         return self.model(x)
 
+
+class YOLOv11BackboneVariantV28(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=128,
+            width=128,
+        )
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2),
+            PSABlock(64, 0.5, 4, True),
+            Conv(64, 32, k=3, s=2),
+            Conv(32, self.latent_dim, k=3, s=2),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            TransposeDecoderV4(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV29(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=128,
+            width=128,
+        )
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2),
+            PSABlock(64, 0.5, 4, True),
+            Conv(64, self.latent_dim, k=3, s=2),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            TransposeDecoderV4(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV30(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=128,
+            width=128,
+        )
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 64, 3, 2),
+            Conv(64, self.latent_dim, k=3, s=2),
+            PSABlock(self.latent_dim, 0.5, 4, True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            TransposeDecoderV4(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class YOLOv11BackboneVariantV31(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=128,
+            width=128,
+        )
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, self.latent_dim, 3, 2),
+            PSABlock(self.latent_dim, 0.5, 4, True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            TransposeDecoderV4(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
 
 
 def parse_args() -> argparse.Namespace:
