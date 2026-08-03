@@ -1257,6 +1257,117 @@ class YOLOv11BackboneVariantV60(nn.Module):
         return self.model(x)
     
 
+class YOLOv11BackboneVariantV61(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256):
+        super().__init__()
+
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=20,
+            width=20,
+        )
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+            Conv(32, 64, k=3, s=2),
+            Conv(64, 128, k=3, s=2),
+            nn.Flatten(1),
+            nn.Linear(128 * 5 * 5 , latent_dim),
+            nn.Unflatten(1, (latent_dim, 1, 1)),
+            TransposeDecoderV6(
+                latent_dim=latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV62(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256):
+        super().__init__()
+
+        self.feature_spec = FeatureSpec(
+            channels=64,
+            height=80,
+            width=80,
+        )
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+            Conv(32, 64, k=3, s=2),
+            Conv(64, 128, k=3, s=2),
+            nn.Flatten(1),
+            nn.Linear(128 * 5 * 5 , latent_dim),
+            nn.Unflatten(1, (latent_dim, 1, 1)),
+            TransposeDecoderV6(
+                latent_dim=latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV63(nn.Module):
+    """Low-latency learned compression and reconstruction at 20x20.
+
+    The encoder uses a non-overlapping 16x16 patch stem to avoid expensive
+    high-resolution convolution stages. It then builds a compact hierarchy at
+    40x40, 20x20, 10x10, and 5x5. A PSA block refines the inexpensive 5x5
+    feature map before a learned 5x5 projection creates the 1x1 latent tensor.
+    TransposeDecoderV6 reconstructs 20x20 directly through the exact
+    1-to-5-to-10-to-20 spatial path without interpolation.
+    """
+
+    def __init__(self, in_channels=3, latent_dim=32):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=20,
+            width=20,
+        )
+        self.latent_dim = latent_dim
+
+        self.model = nn.Sequential(
+            # Explicit padding=0 creates exactly 40x40 non-overlapping patches
+            # from a 640x640 image; automatic padding would produce 41x41.
+            Conv(in_channels, 16, 16, 16, p=0),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            # Apply spatial attention at 5x5, where its token interactions are
+            # substantially cheaper than at earlier high-resolution stages.
+            PSABlock(128, 0.5, 4, True),
+            # Learned full-spatial projection: 128x5x5 -> latent_dim x1x1.
+            nn.Conv2d(
+                128,
+                self.latent_dim,
+                kernel_size=5,
+                stride=1,
+                padding=0,
+            ),
+            TransposeDecoderV6(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
