@@ -1753,6 +1753,328 @@ class TransposeDecoderV7(nn.Module):
         return output
 
 
+class TransposeDecoderV8(nn.Module):
+    """Channel-hourglass decoder with a fixed 64-channel spatial seed.
+
+    V8 maps the complete latent tensor directly into a learned 64-channel
+    spatial seed. Starting from 64 channels substantially reduces the dominant
+    seed parameters while preserving a direct dense mapping from every latent
+    channel into every seed channel and spatial position.
+
+    The remaining stages use the same recoverable hourglass rule as V7: halve
+    channels when possible, but reserve enough stages to double back to the
+    exact requested output width. With a 256-channel latent, examples are::
+
+        FeatureSpec(128, 20, 20)
+        spatial:   1 ->  5 -> 10 ->  20
+        channels: 256 -> 64 -> 64 -> 128
+
+        FeatureSpec(64, 80, 80)
+        spatial:   1 ->  5 -> 10 -> 20 -> 40 -> 80
+        channels: 256 -> 64 -> 32 -> 16 -> 32 -> 64
+
+    All convolutions are dense (``groups=1``), all spatial expansion is
+    learned, and no interpolation or sub-pixel rearrangement is used.
+    """
+
+    seed_channels = 64
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels <= 0:
+            raise ValueError(
+                "TransposeDecoderV8 requires positive output channels, got "
+                f"{output_spec.channels}."
+            )
+        if output_spec.height != output_spec.width:
+            raise ValueError(
+                "TransposeDecoderV8 requires a square output so it can reach "
+                "the requested size without interpolation, got "
+                f"{output_spec.height}x{output_spec.width}."
+            )
+
+        target_extent = output_spec.height
+        if target_extent < 4:
+            raise ValueError(
+                "TransposeDecoderV8 requires an output extent of at least 4, "
+                f"got {target_extent}."
+            )
+
+        power_of_two_target = is_power_of_two(target_extent)
+        if power_of_two_target:
+            seed_extent = 4
+            num_doublings = int(math.log2(target_extent)) - 2
+        else:
+            if target_extent % 2 != 0:
+                raise ValueError(
+                    "TransposeDecoderV8 requires the output extent to be a "
+                    "power of two or divisible by 2, got "
+                    f"{target_extent}."
+                )
+
+            seed_extent = target_extent
+            num_doublings = 0
+            while seed_extent % 2 == 0:
+                seed_extent //= 2
+                num_doublings += 1
+
+            if seed_extent == 1:
+                raise RuntimeError(
+                    "Internal V8 extent decomposition failed for a "
+                    "non-power-of-two target."
+                )
+
+        num_spatial_stages = num_doublings + 1
+        if num_spatial_stages == 1:
+            if output_spec.channels != self.seed_channels:
+                raise ValueError(
+                    "A one-stage V8 decoder can only output its fixed "
+                    f"{self.seed_channels} seed channels, got "
+                    f"{output_spec.channels}."
+                )
+            stage_channels = [self.seed_channels]
+        else:
+            stage_channels = [self.seed_channels]
+            stage_channels.extend(
+                _build_contract_expand_stage_channels(
+                    latent_dim=self.seed_channels,
+                    output_channels=output_spec.channels,
+                    num_stages=num_spatial_stages - 1,
+                )
+            )
+
+        if power_of_two_target:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                self.seed_channels,
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                groups=1,
+                bias=True,
+            )
+        else:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                self.seed_channels,
+                kernel_size=seed_extent,
+                stride=1,
+                padding=0,
+                output_padding=0,
+                groups=1,
+                bias=True,
+            )
+
+        layers: list[nn.Module] = [first_stage]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=1,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.latent_dim = latent_dim
+        self.seed_extent = seed_extent
+        self.stage_channels = tuple(stage_channels)
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        if (
+            latent.ndim != 4
+            or latent.shape[1] != self.latent_dim
+            or latent.shape[-2:] != (1, 1)
+        ):
+            raise ValueError(
+                "TransposeDecoderV8 expects a latent tensor shaped "
+                f"[B, {self.latent_dim}, 1, 1], got {tuple(latent.shape)}."
+            )
+
+        output = self.model(latent)
+        expected_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != expected_size:
+            raise RuntimeError(
+                "TransposeDecoderV8 failed to generate its requested output "
+                f"size {expected_size}; got {output.shape[-2:]}."
+            )
+        return output
+
+
+class TransposeDecoderV9(nn.Module):
+    """Minimum-cost hourglass decoder with an at-most-32-channel seed.
+
+    V9 prioritizes parameters and latency. If ``latent_dim`` is at least 32,
+    the complete latent tensor maps directly into a learned 32-channel spatial
+    seed. If the latent is narrower than 32 channels, V9 keeps that width and
+    lets the recoverable hourglass schedule determine all following stages.
+
+    With a 256-channel latent, the requested reference paths are::
+
+        FeatureSpec(128, 20, 20)
+        spatial:   1 ->  5 -> 10 ->  20
+        channels: 256 -> 32 -> 64 -> 128
+
+        FeatureSpec(64, 80, 80)
+        spatial:   1 ->  5 -> 10 -> 20 -> 40 -> 80
+        channels: 256 -> 32 -> 16 -> 16 -> 32 -> 64
+
+    Every convolution uses ``groups=1``. Spatial growth remains fully learned
+    and exact, with no interpolation or sub-pixel rearrangement.
+    """
+
+    maximum_seed_channels = 32
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels <= 0:
+            raise ValueError(
+                "TransposeDecoderV9 requires positive output channels, got "
+                f"{output_spec.channels}."
+            )
+        if output_spec.height != output_spec.width:
+            raise ValueError(
+                "TransposeDecoderV9 requires a square output so it can reach "
+                "the requested size without interpolation, got "
+                f"{output_spec.height}x{output_spec.width}."
+            )
+
+        target_extent = output_spec.height
+        if target_extent < 4:
+            raise ValueError(
+                "TransposeDecoderV9 requires an output extent of at least 4, "
+                f"got {target_extent}."
+            )
+
+        seed_channels = min(latent_dim, self.maximum_seed_channels)
+        power_of_two_target = is_power_of_two(target_extent)
+        if power_of_two_target:
+            seed_extent = 4
+            num_doublings = int(math.log2(target_extent)) - 2
+        else:
+            if target_extent % 2 != 0:
+                raise ValueError(
+                    "TransposeDecoderV9 requires the output extent to be a "
+                    "power of two or divisible by 2, got "
+                    f"{target_extent}."
+                )
+
+            seed_extent = target_extent
+            num_doublings = 0
+            while seed_extent % 2 == 0:
+                seed_extent //= 2
+                num_doublings += 1
+
+            if seed_extent == 1:
+                raise RuntimeError(
+                    "Internal V9 extent decomposition failed for a "
+                    "non-power-of-two target."
+                )
+
+        num_spatial_stages = num_doublings + 1
+        if num_spatial_stages == 1:
+            stage_channels = [output_spec.channels]
+        else:
+            stage_channels = [seed_channels]
+            stage_channels.extend(
+                _build_contract_expand_stage_channels(
+                    latent_dim=seed_channels,
+                    output_channels=output_spec.channels,
+                    num_stages=num_spatial_stages - 1,
+                )
+            )
+
+        if power_of_two_target:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                groups=1,
+                bias=True,
+            )
+        else:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=seed_extent,
+                stride=1,
+                padding=0,
+                output_padding=0,
+                groups=1,
+                bias=True,
+            )
+
+        layers: list[nn.Module] = [first_stage]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=1,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.latent_dim = latent_dim
+        self.seed_channels = seed_channels
+        self.seed_extent = seed_extent
+        self.stage_channels = tuple(stage_channels)
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        if (
+            latent.ndim != 4
+            or latent.shape[1] != self.latent_dim
+            or latent.shape[-2:] != (1, 1)
+        ):
+            raise ValueError(
+                "TransposeDecoderV9 expects a latent tensor shaped "
+                f"[B, {self.latent_dim}, 1, 1], got {tuple(latent.shape)}."
+            )
+
+        output = self.model(latent)
+        expected_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != expected_size:
+            raise RuntimeError(
+                "TransposeDecoderV9 failed to generate its requested output "
+                f"size {expected_size}; got {output.shape[-2:]}."
+            )
+        return output
+
+
 def is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
 

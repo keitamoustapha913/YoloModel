@@ -26,6 +26,8 @@ from modules import (
     TransposeDecoderV5,
     TransposeDecoderV6,
     TransposeDecoderV7,
+    TransposeDecoderV8,
+    TransposeDecoderV9,
     LogicalReconstructionNetR2V2,
     LogicalReconstructionNetR2V3,
     LogicalReconstructionNetR2V4,
@@ -1398,6 +1400,76 @@ class YOLOv11BackboneVariantV64(nn.Module):
                 padding=0,
             ),
             TransposeDecoderV7(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV65(nn.Module):
+    """V64 encoder with the fixed-64-seed TransposeDecoderV8."""
+
+    def __init__(self, in_channels=3, latent_dim=256):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=64,
+            height=80,
+            width=80,
+        )
+        self.latent_dim = latent_dim
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 16, 16, p=0),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            PSABlock(128, 0.5, 4, True),
+            nn.Conv2d(
+                128,
+                self.latent_dim,
+                kernel_size=5,
+                stride=1,
+                padding=0,
+            ),
+            TransposeDecoderV8(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV66(nn.Module):
+    """V64 encoder with the at-most-32-seed TransposeDecoderV9."""
+
+    def __init__(self, in_channels=3, latent_dim=256):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=64,
+            height=80,
+            width=80,
+        )
+        self.latent_dim = latent_dim
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 16, 16, p=0),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            PSABlock(128, 0.5, 4, True),
+            nn.Conv2d(
+                128,
+                self.latent_dim,
+                kernel_size=5,
+                stride=1,
+                padding=0,
+            ),
+            TransposeDecoderV9(
                 latent_dim=self.latent_dim,
                 output_spec=self.feature_spec,
             ),
