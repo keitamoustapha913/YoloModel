@@ -23,10 +23,22 @@ from modules import (
     TransposeDecoderV2,
     TransposeDecoderV3,
     TransposeDecoderV4,
+    TransposeDecoderV5,
+    TransposeDecoderV6,
     LogicalReconstructionNetR2V2,
     LogicalReconstructionNetR2V3,
     LogicalReconstructionNetR2V4,
     LogicalReconstructionNetR2V5,
+    LogicalReconstructionNetR2V6,
+    MuDeNetReconstructionV1,
+    MuDeNetReconstructionsV1,
+    ChannelAttention,
+    SpatialAttention,
+    MuDeNetReconstructionV2,
+    MuDeNetReconstructionV3,
+    FrozenResNet18PyramidV2,
+    FrozenMuDeNetTeacherV2,
+    
 )
 
 
@@ -736,8 +748,8 @@ class YOLOv11BackboneVariantV37(nn.Module):
         super().__init__()
 
         output_specs = [
-            FeatureSpec(128, 80, 80),
-            FeatureSpec(128, 40, 40),
+            FeatureSpec(64, 80, 80),
+            FeatureSpec(64, 40, 40),
             FeatureSpec(128, 20, 20),
         ]
 
@@ -776,6 +788,474 @@ class YOLOv11BackboneVariantV38(nn.Module):
 
     def forward(self, x):
         return self.model(x)
+    
+
+
+
+
+class YOLOv11BackboneVariantV39(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            C3k2(32, 64, 1, False, 0.25),
+            Conv(64, 64, 3, 2),
+            C3k2(64, 128, 1, False, 0.25),
+            Conv(128, 128, 3, 2),
+            C3k2(128, 128, 1, True),
+            Conv(128, 256, 3, 2),
+            C3k2(256, 256, 1, True),
+            C2PSA(256, 256, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV40(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            # C3k2(128, 128, 1, True),
+            C2PSA(128, 128, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV41(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            C2PSA(128, 128, 1),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            Conv(128, self.latent_dim, 1, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV42(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            PSABlock(128, 1.0, 4, True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            Conv(128, self.latent_dim, 1, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class YOLOv11BackboneVariantV43(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            C3k2(128, 128, 1, True)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV44(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.latent_dim = 32
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            C3k2(128, 128, 1, False, 0.5, False)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV45(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 3, 4),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            C3k2(128, 128, 1, True, 0.5, False)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class YOLOv11BackboneVariantV46(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 3, 4),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            Conv(128, 128, 3, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
+
+class YOLOv11BackboneVariantV47(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 16, 3, 4),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 1),
+            Conv(64, 64, 3, 2),
+            Conv(64, 128, 3, 1),
+            Conv(128, 64, 3, 2),
+            C3k2(64, 128, 1, False, 0.5, True)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV48(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            MuDeNetReconstructionV1(in_channels)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
+
+class YOLOv11BackboneVariantV49(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            MuDeNetReconstructionsV1()
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV50(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 4),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            # Conv(32, 64, 3, 2),
+            # Conv(64, 128, 3, 2),
+            # Conv(128, 128, 3, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
+class YOLOv11BackboneVariantV51(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 4),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            Conv(8, 64, 3, 1),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
+    
+class YOLOv11BackboneVariantV52(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            MuDeNetReconstructionV2(3)
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+    
+class YOLOv11BackboneVariantV53(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            FrozenResNet18PyramidV2()
+        )
+
+    def forward(self, x):
+        return self.model(x) # ((1, 64, 160, 160), (1, 128, 80, 80), (1, 256, 40, 40))
+    
+
+class YOLOv11BackboneVariantV54(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            FrozenMuDeNetTeacherV2()
+        )
+
+    def forward(self, x):
+        return self.model(x) # ((1, 64, 160, 160), (1, 128, 80, 80), (1, 256, 40, 40))
+    
+
+class YOLOv11BackboneVariantV55(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=64,
+            height=80,
+            width=80,
+        )
+        self.latent_dim = 256
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+            # Conv(32, 64, k=3, s=2),
+            # Conv(64, 128, k=3, s=2),
+            # C3k2(64, 128, 1, False, 0.5, False),
+            nn.Conv2d(
+                32,
+                self.latent_dim,
+                kernel_size=5,
+                stride=4,
+                padding=0,
+            ),
+            # Conv(256, 256, k=5, s=1),
+            # Conv(128, 256, k=3, s=2),
+            # TransposeDecoderV6(
+            #     latent_dim=self.latent_dim,
+            #     output_spec=self.feature_spec,
+            # ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV56(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=20,
+            width=20,
+        )
+        self.latent_dim = 64
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+
+            # Conv(32, 64, k=3, s=2),
+            # Conv(64, 128, k=3, s=2),
+            # C3k2(64, 64, 1, False, 0.5, False),
+            # nn.Conv2d(
+            #     32,
+            #     self.latent_dim,
+            #     kernel_size=3,
+            #     stride=4,
+            #     padding=0,
+            # ),
+            # nn.Conv2d(
+            #     64,
+            #     self.latent_dim,
+            #     kernel_size=5,
+            #     stride=1,
+            #     padding=0,
+            # ),
+            # Conv(256, 256, k=5, s=1),
+            # Conv(128, 256, k=3, s=2),
+
+            nn.Flatten(1),
+            nn.Linear(32 * 20 * 20, 64),
+            nn.Unflatten(1, (64, 1, 1)),
+            TransposeDecoderV6(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+class YOLOv11BackboneVariantV57(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=20,
+            width=20,
+        )
+        self.latent_dim = 64
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+
+            nn.AdaptiveAvgPool2d((1, 1)),
+            Conv(32, 32, 1, 2),
+
+            # nn.Flatten(1),
+            # nn.Linear(32 * 20 * 20, 64),
+            # nn.Unflatten(1, (64, 1, 1)),
+            # TransposeDecoderV6(
+            #     latent_dim=self.latent_dim,
+            #     output_spec=self.feature_spec,
+            # ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+
+
+class YOLOv11BackboneVariantV58(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+
+        output_specs = [
+            FeatureSpec(64, 80, 80),
+            FeatureSpec(64, 40, 40),
+            FeatureSpec(128, 20, 20),
+        ]
+
+        image_size = 640
+
+        self.model = nn.Sequential(
+            LogicalReconstructionNetR2V6(
+                image_size=image_size,
+                output_specs=output_specs,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
+
+
+class YOLOv11BackboneVariantV59(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=128,
+            height=20,
+            width=20,
+        )
+        latent_dim = 64
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+
+            nn.Flatten(1),
+            nn.Linear(32 * 20 * 20, latent_dim),
+            nn.Unflatten(1, (latent_dim, 1, 1)),
+            # TransposeDecoderV6(
+            #     latent_dim=latent_dim,
+            #     output_spec=self.feature_spec,
+            # ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class YOLOv11BackboneVariantV60(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256):
+        super().__init__()
+
+        self.model = nn.Sequential(
+            Conv(in_channels, 8, 3, 2),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 32, 3, 2),
+            PSABlock(32, 0.5, 4, True),
+            Conv(32, 64, k=3, s=2),
+            Conv(64, 128, k=3, s=2),
+            nn.Flatten(1),
+            nn.Linear(128 * 5 * 5 , latent_dim),
+            nn.Unflatten(1, (latent_dim, 1, 1))
+        )
+
+    def forward(self, x):
+        return self.model(x)
+    
 
 
 def parse_args() -> argparse.Namespace:

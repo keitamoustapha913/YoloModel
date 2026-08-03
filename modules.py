@@ -7,7 +7,8 @@ import torch
 from torch import nn, Tensor
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Sequence, Optional, Tuple, List, Union
+from torchvision.models import ResNet18_Weights, resnet18
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
@@ -868,6 +869,75 @@ def _build_progressive_stage_channels(
     return channels
 
 
+def _build_progressive_reduction_stage_channels(
+    latent_dim: int,
+    output_channels: int,
+    num_stages: int,
+) -> list[int]:
+    """Create the reverse of the progressive V5 channel-growth schedule.
+
+    Each entry is the output-channel count of one spatial decoder stage. The
+    schedule starts at ``latent_dim``, progressively halves channel width, and
+    finishes at exactly ``output_channels``. Reductions occur early enough to
+    mirror the increasing schedule in reverse, limiting wide channel tensors
+    at the largest and most expensive spatial resolutions.
+
+    This helper only builds decoder configuration during ``__init__`` and adds
+    no inference-time operations.
+
+    Args:
+        latent_dim: Number of channels entering the decoder. It must be
+            greater than or equal to ``output_channels``.
+        output_channels: Required number of channels in the final output.
+        num_stages: Number of spatial decoder stages, including the initial
+            learned seed stage.
+
+    Returns:
+        A non-increasing list containing one channel count per stage. The last
+        entry is always exactly ``output_channels``.
+
+    Example:
+        Reversing a five-stage 64-to-256 growth schedule gives:
+
+        >>> _build_progressive_reduction_stage_channels(256, 64, 5)
+        [256, 128, 128, 64, 64]
+    """
+
+    if latent_dim < 1:
+        raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+    if output_channels < 1:
+        raise ValueError(
+            f"output_channels must be positive, got {output_channels}."
+        )
+    if latent_dim < output_channels:
+        raise ValueError(
+            "latent_dim must be greater than or equal to output_channels, "
+            f"got {latent_dim} and {output_channels}."
+        )
+    if num_stages < 1:
+        raise ValueError(f"num_stages must be positive, got {num_stages}.")
+    if num_stages == 1:
+        return [output_channels]
+
+    reduction_levels = math.ceil(math.log2(latent_dim / output_channels))
+    channels: list[int] = []
+    for stage_index in range(num_stages):
+        # Ceil applies reductions toward the beginning of the spatial path.
+        # This is the temporal reverse of V5 growth, which uses floor to delay
+        # channel increases until later stages.
+        level = math.ceil(
+            stage_index * reduction_levels / (num_stages - 1)
+        )
+        channels.append(
+            max(output_channels, latent_dim // (2**level))
+        )
+
+    # Support ratios that are not exact powers of two without undershooting
+    # or overshooting the requested final channel count.
+    channels[-1] = output_channels
+    return channels
+
+
 
 class TransposeDecoder(nn.Module):
     """Decode [B, Z, 1, 1] into one requested teacher-map shape."""
@@ -1156,10 +1226,10 @@ class TransposeDecoderV4(nn.Module):
                 layers.append(nn.ReLU(inplace=True))
 
         self.stage_channels = tuple(stage_channels)
-        self.network = nn.Sequential(*layers)
+        self.model = nn.Sequential(*layers)
 
     def forward(self, latent: Tensor) -> Tensor:
-        output = self.network(latent)
+        output = self.model(latent)
         target_size = (self.output_spec.height, self.output_spec.width)
         if output.shape[-2:] != target_size:
             output = F.interpolate(
@@ -1167,6 +1237,293 @@ class TransposeDecoderV4(nn.Module):
                 size=target_size,
                 mode="bilinear",
                 align_corners=False,
+            )
+        return output
+
+
+class TransposeDecoderV5(nn.Module):
+    """Generate square power-of-two and odd-base feature maps exactly.
+
+    Power-of-two targets retain the V4 spatial architecture::
+
+        1 -> 4 -> 8 -> 16 -> ... -> target
+
+    A non-power-of-two target divisible by two is decomposed into an odd base
+    multiplied by a power of two. The decoder learns the odd-sized seed
+    directly and then doubles it until it reaches the requested extent. For
+    example, 80 is ``5 * 2**4``, which produces::
+
+        1 -> 5 -> 10 -> 20 -> 40 -> 80
+
+    This avoids generating a larger power-of-two map and resizing it back to
+    the requested shape. Every channel-changing stage remains dense
+    (``groups=1``), as in V4.
+    """
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels < latent_dim:
+            raise ValueError(
+                "TransposeDecoderV5 requires output channels to be greater "
+                f"than or equal to latent_dim, got {output_spec.channels} "
+                f"and {latent_dim}."
+            )
+        if output_spec.height != output_spec.width:
+            raise ValueError(
+                "TransposeDecoderV5 requires a square output so it can reach "
+                "the requested size without interpolation, got "
+                f"{output_spec.height}x{output_spec.width}."
+            )
+
+        target_extent = output_spec.height
+        if target_extent < 4:
+            raise ValueError(
+                "TransposeDecoderV5 requires an output extent of at least 4, "
+                f"got {target_extent}."
+            )
+
+        power_of_two_target = is_power_of_two(target_extent)
+        if power_of_two_target:
+            seed_extent = 4
+            num_doublings = int(math.log2(target_extent)) - 2
+        else:
+            if target_extent % 2 != 0:
+                raise ValueError(
+                    "TransposeDecoderV5 requires the output extent to be a "
+                    "power of two or divisible by 2, got "
+                    f"{target_extent}."
+                )
+
+            # Remove every factor of two. The remaining odd factor is the
+            # smallest exact seed from which repeated doubling reaches the
+            # target. For 80 this yields a 5x5 seed and four doublings.
+            seed_extent = target_extent
+            num_doublings = 0
+            while seed_extent % 2 == 0:
+                seed_extent //= 2
+                num_doublings += 1
+
+            if seed_extent == 1:
+                raise RuntimeError(
+                    "Internal V5 extent decomposition failed for a "
+                    "non-power-of-two target."
+                )
+
+        num_spatial_stages = num_doublings + 1
+        stage_channels = _build_progressive_stage_channels(
+            latent_dim=latent_dim,
+            output_channels=output_spec.channels,
+            num_stages=num_spatial_stages,
+        )
+
+        if power_of_two_target:
+            # Match V4 exactly: a dense 3x3 transposed convolution maps the
+            # latent 1x1 tensor to the initial 4x4 feature map.
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                groups=1,
+                bias=True,
+            )
+        else:
+            # A stride-1 transposed convolution maps 1x1 directly to the odd
+            # seed extent. For an 80x80 target, kernel_size=5 creates 5x5.
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=seed_extent,
+                stride=1,
+                padding=0,
+                output_padding=0,
+                groups=1,
+                bias=True,
+            )
+
+        layers: list[nn.Module] = [first_stage]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=1,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.seed_extent = seed_extent
+        self.stage_channels = tuple(stage_channels)
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        output = self.model(latent)
+        expected_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != expected_size:
+            raise RuntimeError(
+                "TransposeDecoderV5 failed to generate its requested output "
+                f"size {expected_size}; got {output.shape[-2:]}."
+            )
+        return output
+
+
+class TransposeDecoderV6(nn.Module):
+    """Increase spatial size while adapting channel width progressively.
+
+    V6 includes both channel directions. When ``latent_dim`` is smaller than
+    the requested output channels, it uses V5's progressive growth schedule.
+    When ``latent_dim`` is greater than or equal to the output channels, it
+    uses the reverse progressive reduction schedule. Power-of-two spatial
+    targets retain V4's ``1 -> 4`` seed path; even non-power-of-two targets
+    use V5's exact odd-base path and therefore require no interpolation.
+
+    For a 256-channel latent tensor and a 64x80x80 output, the complete learned
+    schedule is::
+
+        spatial:  1 ->   5 ->  10 ->  20 -> 40 -> 80
+        channels: 256 -> 256 -> 128 -> 128 -> 64 -> 64
+
+    All transposed convolutions use ``groups=1`` for dense channel mixing.
+    """
+
+    def __init__(self, latent_dim: int, output_spec: FeatureSpec) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels <= 0:
+            raise ValueError(
+                "TransposeDecoderV6 requires positive output channels, got "
+                f"{output_spec.channels}."
+            )
+        if output_spec.height != output_spec.width:
+            raise ValueError(
+                "TransposeDecoderV6 requires a square output so it can reach "
+                "the requested size without interpolation, got "
+                f"{output_spec.height}x{output_spec.width}."
+            )
+
+        target_extent = output_spec.height
+        if target_extent < 4:
+            raise ValueError(
+                "TransposeDecoderV6 requires an output extent of at least 4, "
+                f"got {target_extent}."
+            )
+
+        power_of_two_target = is_power_of_two(target_extent)
+        if power_of_two_target:
+            seed_extent = 4
+            num_doublings = int(math.log2(target_extent)) - 2
+        else:
+            if target_extent % 2 != 0:
+                raise ValueError(
+                    "TransposeDecoderV6 requires the output extent to be a "
+                    "power of two or divisible by 2, got "
+                    f"{target_extent}."
+                )
+
+            # Factor target_extent into odd_seed * 2**num_doublings. This
+            # reaches targets such as 80 exactly through 5, 10, 20, 40, 80.
+            seed_extent = target_extent
+            num_doublings = 0
+            while seed_extent % 2 == 0:
+                seed_extent //= 2
+                num_doublings += 1
+
+            if seed_extent == 1:
+                raise RuntimeError(
+                    "Internal V6 extent decomposition failed for a "
+                    "non-power-of-two target."
+                )
+
+        num_spatial_stages = num_doublings + 1
+        if latent_dim < output_spec.channels:
+            stage_channels = _build_progressive_stage_channels(
+                latent_dim=latent_dim,
+                output_channels=output_spec.channels,
+                num_stages=num_spatial_stages,
+            )
+            self.channel_direction = "growth"
+        else:
+            stage_channels = _build_progressive_reduction_stage_channels(
+                latent_dim=latent_dim,
+                output_channels=output_spec.channels,
+                num_stages=num_spatial_stages,
+            )
+            self.channel_direction = "reduction"
+
+        if power_of_two_target:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                groups=1,
+                bias=True,
+            )
+        else:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=seed_extent,
+                stride=1,
+                padding=0,
+                output_padding=0,
+                groups=1,
+                bias=True,
+            )
+
+        layers: list[nn.Module] = [first_stage]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=1,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.seed_extent = seed_extent
+        self.stage_channels = tuple(stage_channels)
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        output = self.model(latent)
+        expected_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != expected_size:
+            raise RuntimeError(
+                "TransposeDecoderV6 failed to generate its requested output "
+                f"size {expected_size}; got {output.shape[-2:]}."
             )
         return output
 
@@ -1810,13 +2167,13 @@ class LogicalReconstructionNetR2V5(nn.Module):
 
         self.image_size = image_size
         self.output_specs = tuple(output_specs)
-        self.encoder = nn.Sequential(
+        self.model = nn.Sequential(
             Conv(3, 8, 3, 4),
             Conv(8, 16, 3, 2),
             Conv(16, 32, 3, 2),
             Conv(32, 64, 3, 2),
         )
-        self.heads = nn.ModuleList(
+        self.network = nn.ModuleList(
             [
                 nn.Conv2d(
                     stage_channels,
@@ -1826,6 +2183,787 @@ class LogicalReconstructionNetR2V5(nn.Module):
                     padding=0,
                     groups=1,
                     bias=True,
+                )
+                for stage_channels, spec in zip(
+                    (16, 32, 64),
+                    self.output_specs,
+                )
+            ]
+        )
+
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        expected_size = (self.image_size, self.image_size)
+        if image.ndim != 4 or image.shape[1] != 3:
+            raise ValueError(
+                "Expected an RGB image tensor shaped [B, 3, H, W], "
+                f"got {tuple(image.shape)}."
+            )
+        if image.shape[-2:] != expected_size:
+            raise ValueError(
+                f"Expected spatial size {expected_size}, got {image.shape[-2:]}."
+            )
+
+        outputs: list[Tensor] = []
+        feature = image
+        for index, layer in enumerate(self.model):
+            feature = layer(feature)
+            if index > 0:
+                outputs.append(self.network[index - 1](feature))
+
+        return outputs[0], outputs[1], outputs[2]
+
+
+
+
+
+class MuDeNetReconstructionV1(nn.Module):
+    """
+    Input:
+        [B, in_channels, 640, 640]
+
+    Outputs:
+        y1: [B,  64, 80, 80]
+        y2: [B,  64, 40, 40]
+        y3: [B, 128, 20, 20]
+    """
+
+    def __init__(self, in_channels: int = 3) -> None:
+        super().__init__()
+
+        self.stage160 = Conv(
+            in_channels,
+            16,
+            k=3,
+            s=4,
+        )
+
+        self.stage80 = Conv(
+            16,
+            32,
+            k=3,
+            s=2,
+        )
+
+        self.stage40 = Conv(
+            32,
+            64,
+            k=3,
+            s=2,
+        )
+
+        self.stage20 = nn.Sequential(
+            Conv(
+                64,
+                128,
+                k=3,
+                s=2,
+            ),
+            Conv(
+                128,
+                128,
+                k=3,
+                s=1,
+            ),
+        )
+
+        # Linear output projections.
+        self.output80 = nn.Conv2d(
+            32,
+            64,
+            kernel_size=1,
+        )
+
+        self.output40 = nn.Conv2d(
+            64,
+            64,
+            kernel_size=1,
+        )
+
+        self.output20 = nn.Conv2d(
+            128,
+            128,
+            kernel_size=1,
+        )
+
+    def forward(
+        self,
+        x: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+
+        x160 = self.stage160(x)
+        x80 = self.stage80(x160)
+        x40 = self.stage40(x80)
+        x20 = self.stage20(x40)
+
+        y1 = self.output80(x80)
+        y2 = self.output40(x40)
+        y3 = self.output20(x20)
+
+        return y1, y2, y3
+    
+
+class MuDeNetReconstructionsV1(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+
+        self.r1 = MuDeNetReconstructionV1(in_channels=3)
+        self.r2 = MuDeNetReconstructionV1(in_channels=3)
+
+    def forward(self, x):
+        r1_outputs = self.r1(x)
+        r2_outputs = self.r2(x)
+
+        return r1_outputs, r2_outputs
+    
+
+class ChannelAttention(nn.Module):
+    """Channel-attention module for feature recalibration.
+
+    Applies attention weights to channels based on global average pooling.
+
+    Attributes:
+        pool (nn.AdaptiveAvgPool2d): Global average pooling.
+        fc (nn.Conv2d): Fully connected layer implemented as 1x1 convolution.
+        act (nn.Sigmoid): Sigmoid activation for attention weights.
+
+    References:
+        https://github.com/open-mmlab/mmdetection/tree/v3.0.0rc1/configs/rtmdet
+    """
+
+    def __init__(self, channels: int) -> None:
+        """Initialize Channel-attention module.
+
+        Args:
+            channels (int): Number of input channels.
+        """
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Conv2d(channels, channels, 1, 1, 0, bias=True)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply channel attention to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Channel-attended output tensor.
+        """
+        return x * self.act(self.fc(self.pool(x)))
+
+
+class SpatialAttention(nn.Module):
+    """Spatial-attention module for feature recalibration.
+
+    Applies attention weights to spatial dimensions based on channel statistics.
+
+    Attributes:
+        cv1 (nn.Conv2d): Convolution layer for spatial attention.
+        act (nn.Sigmoid): Sigmoid activation for attention weights.
+    """
+
+    def __init__(self, kernel_size=7):
+        """Initialize Spatial-attention module.
+
+        Args:
+            kernel_size (int): Size of the convolutional kernel (3 or 7).
+        """
+        super().__init__()
+        assert kernel_size in {3, 7}, "kernel size must be 3 or 7"
+        padding = 3 if kernel_size == 7 else 1
+        self.cv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.act = nn.Sigmoid()
+
+    def forward(self, x):
+        """Apply spatial attention to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Spatial-attended output tensor.
+        """
+        return x * self.act(self.cv1(torch.cat([torch.mean(x, 1, keepdim=True), torch.max(x, 1, keepdim=True)[0]], 1)))
+
+
+class CBAM(nn.Module):
+    """Convolutional Block Attention Module.
+
+    Combines channel and spatial attention mechanisms for comprehensive feature refinement.
+
+    Attributes:
+        channel_attention (ChannelAttention): Channel attention module.
+        spatial_attention (SpatialAttention): Spatial attention module.
+    """
+
+    def __init__(self, c1, kernel_size=7):
+        """Initialize CBAM with given parameters.
+
+        Args:
+            c1 (int): Number of input channels.
+            kernel_size (int): Size of the convolutional kernel for spatial attention.
+        """
+        super().__init__()
+        self.channel_attention = ChannelAttention(c1)
+        self.spatial_attention = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        """Apply channel and spatial attention sequentially to input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Attended output tensor.
+        """
+        return self.spatial_attention(self.channel_attention(x))
+
+class MuDeNetReconstructionV2(nn.Module):
+    """
+    Input:
+        [B, in_channels, 640, 640]
+
+    Outputs:
+        y1: [B,  64, 80, 80]
+        y2: [B,  64, 40, 40]
+        y3: [B, 128, 20, 20]
+    """
+
+    def __init__(self, in_channels: int = 3) -> None:
+        super().__init__()
+
+        self.stage160 = Conv(
+            in_channels,
+            8,
+            k=3,
+            s=4,
+        )
+
+        self.stage80 = Conv(
+            8,
+            16,
+            k=3,
+            s=2,
+        )
+
+        self.stage40 = Conv(
+            16,
+            32,
+            k=3,
+            s=2,
+        )
+
+        # Linear output projections.
+        self.output80 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            Conv(8, 16, 3, 1),
+            Conv(16, 32, 3, 1),
+            Conv(32, 64, 3, 1),
+        )
+
+        self.output40 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            Conv(16, 32, 3, 1),
+            Conv(32, 64, 3, 1),
+        )
+
+        self.output20 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            Conv(32, 64, 3, 1),
+            Conv(64, 128, 3, 1),
+        )
+
+
+    def forward(
+        self,
+        x: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+
+        x160 = self.stage160(x)
+        x80 = self.stage80(x160)
+        x40 = self.stage40(x80)
+
+        y1 = self.output80(x160)
+        y2 = self.output40(x80)
+        y3 = self.output20(x40)
+
+        return y1, y2 , y3
+    
+
+
+
+class MuDeNetReconstructionV3(nn.Module):
+    """
+    Input:
+        [B, in_channels, 640, 640]
+
+    Outputs:
+        y1: [B,  64, 80, 80]
+        y2: [B,  64, 40, 40]
+        y3: [B, 128, 20, 20]
+    """
+
+    def __init__(self, in_channels: int = 3) -> None:
+        super().__init__()
+
+        self.stage160 = Conv(
+            in_channels,
+            8,
+            k=3,
+            s=4,
+        )
+
+        self.stage80 = Conv(
+            8,
+            16,
+            k=3,
+            s=2,
+        )
+
+        self.stage40 = Conv(
+            16,
+            32,
+            k=3,
+            s=2,
+        )
+
+        # Linear output projections.
+        self.output80 = nn.Sequential(
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            Conv(8, 16, 3, 1),
+            Conv(16, 32, 3, 1),
+            Conv(32, 64, 3, 1),
+        )
+
+        # self.output40 = nn.Sequential(
+        #     nn.AvgPool2d(kernel_size=2, stride=2),
+        #     Conv(16, 32, 3, 1),
+        #     Conv(32, 64, 3, 1),
+        # )
+
+        # self.output20 = nn.Sequential(
+        #     nn.AvgPool2d(kernel_size=2, stride=2),
+        #     Conv(32, 64, 3, 1),
+        #     Conv(64, 128, 3, 1),
+        # )
+
+
+    def forward(
+        self,
+        x: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+
+        x160 = self.stage160(x)
+        # x80 = self.stage80(x160)
+        # x40 = self.stage40(x80)
+
+        y1 = self.output80(x160)
+        # y2 = self.output40(x80)
+        # y3 = self.output20(x40)
+
+        return y1
+
+class FrozenResNet18PyramidV2(nn.Module):
+    """
+    Frozen ImageNet-pretrained ResNet-18 used only to create
+    pre-distillation targets.
+
+    Expected input:
+        [B, 3, 640, 640]
+
+    Returned features:
+        layer1: [B,  64, 160, 160]
+        layer2: [B, 128,  80,  80]
+        layer3: [B, 256,  40,  40]
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
+
+        self.conv1 = backbone.conv1
+        self.bn1 = backbone.bn1
+        self.relu = backbone.relu
+        self.maxpool = backbone.maxpool
+
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+
+        self.eval()
+
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.inference_mode()
+    def forward(self, image: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        # Initial ResNet stem, before max pooling.
+        f1 = self.relu(self.bn1(self.conv1(image)))
+
+        # First residual stage.
+        x = self.maxpool(f1)
+        layer1 = self.layer1(x)
+
+        # Second residual stage.
+        layer2 = self.layer2(layer1)
+        
+        # Third residual stage.
+        layer3 = self.layer3(layer2)
+
+        return layer1, layer2, layer3
+
+
+FeaturePyramid = Tuple[Tensor, Tensor, Tensor]
+
+
+class UnifiedEmbeddingBuilderV2(nn.Module):
+    """
+    Creates the MuDeNet-style unified target embedding E.
+
+    Steps:
+        1. Spatially align ResNet feature maps.
+        2. Concatenate along the channel dimension.
+        3. Select a fixed random subset of channels.
+        4. Apply channel-wise z-score normalization.
+    """
+
+    def __init__(
+        self,
+        output_channels: int = 128,
+        random_seed: int = 42,
+        epsilon: float = 1e-6,
+    ) -> None:
+        super().__init__()
+
+        # f1: 64 channels
+        # f2: 128 channels
+        # f3: 256 channels
+
+        ######################################
+
+        # Exact spatial reduction by two:
+        # 160 -> 80
+        # 80  -> 40
+        # 40  -> 20
+        self.spatial_downsample = nn.AvgPool2d(
+            kernel_size=2,
+            stride=2,
+        )
+
+        self.epsilon = float(epsilon)
+
+        # -------------------------------------------------
+        # Create fixed channel indices.
+        #
+        # These are generated only once and are saved in
+        # the model state_dict as buffers.
+        # -------------------------------------------------
+
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(random_seed)
+
+        # layer2: select 64 from 128 channels.
+        layer2_indices = torch.randperm(
+            128,
+            generator=generator,
+        )[:64]
+
+        # layer3: select 128 from 256 channels.
+        layer3_indices = torch.randperm(
+            256,
+            generator=generator,
+        )[:128]
+
+        # Sorting does not change which channels were chosen.
+        # It gives a more regular channel-access pattern.
+        layer2_indices = layer2_indices.sort().values
+        layer3_indices = layer3_indices.sort().values
+
+        self.register_buffer(
+            "layer2_indices",
+            layer2_indices,
+            persistent=True,
+        )
+
+        self.register_buffer(
+            "layer3_indices",
+            layer3_indices,
+            persistent=True,
+        )
+
+        # -------------------------------------------------
+        # Normalization statistics.
+        #
+        # They are initialized as identity normalization:
+        # mean = 0
+        # std  = 1
+        #
+        # They are replaced during calibration.
+        # -------------------------------------------------
+
+        self.register_buffer(
+            "t1_mean",
+            torch.zeros(1, 64, 1, 1),
+            persistent=True,
+        )
+        self.register_buffer(
+            "t1_std",
+            torch.ones(1, 64, 1, 1),
+            persistent=True,
+        )
+
+        self.register_buffer(
+            "t2_mean",
+            torch.zeros(1, 64, 1, 1),
+            persistent=True,
+        )
+        self.register_buffer(
+            "t2_std",
+            torch.ones(1, 64, 1, 1),
+            persistent=True,
+        )
+
+        self.register_buffer(
+            "t3_mean",
+            torch.zeros(1, 128, 1, 1),
+            persistent=True,
+        )
+        self.register_buffer(
+            "t3_std",
+            torch.ones(1, 128, 1, 1),
+            persistent=True,
+        )
+
+        self.register_buffer(
+            "statistics_ready",
+            torch.tensor(False),
+            persistent=True,
+        )
+
+    def raw_embedding_descriptors(
+        self,
+        features: Tuple[Tensor, Tensor, Tensor],
+    ) -> Tensor:
+        f1, f2, f3 = features
+
+        ########################################
+
+        # -----------------------------------------------
+        # T1
+        #
+        # layer1 already has 64 channels, so no selection.
+        # [B,64,160,160] -> [B,64,80,80]
+        # -----------------------------------------------
+
+        t1 = self.spatial_downsample(f1)
+
+        # -----------------------------------------------
+        # T2
+        #
+        # Select before resizing:
+        # [B,128,80,80]
+        #     -> [B,64,80,80]
+        #     -> [B,64,40,40]
+        # -----------------------------------------------
+
+        f2_selected = torch.index_select(
+            f2,
+            dim=1,
+            index=self.layer2_indices,
+        )
+
+        t2 = self.spatial_downsample(f2_selected)
+
+        # -----------------------------------------------
+        # T3
+        #
+        # Select before resizing:
+        # [B,256,40,40]
+        #     -> [B,128,40,40]
+        #     -> [B,128,20,20]
+        # -----------------------------------------------
+
+        f3_selected = torch.index_select(
+            f3,
+            dim=1,
+            index=self.layer3_indices,
+        )
+
+        t3 = self.spatial_downsample(f3_selected)
+
+        return t1, t2, t3
+    
+    def normalize_descriptors(
+        self,
+        descriptors: Tuple[Tensor, Tensor, Tensor],
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Apply independently calibrated channel-wise statistics.
+        """
+
+        # if not bool(self.statistics_ready.item()):
+        #     raise RuntimeError(
+        #         "Teacher statistics have not been calibrated. "
+        #         "Run calibrate_teacher_statistics() first, or call "
+        #         "forward(..., normalize=False)."
+        #     )
+
+        t1, t2, t3 = descriptors
+
+        t1_normalized = (
+            t1 - self.t1_mean
+        ) / self.t1_std.clamp_min(self.epsilon)
+
+        t2_normalized = (
+            t2 - self.t2_mean
+        ) / self.t2_std.clamp_min(self.epsilon)
+
+        t3_normalized = (
+            t3 - self.t3_mean
+        ) / self.t3_std.clamp_min(self.epsilon)
+
+        return (
+            t1_normalized,
+            t2_normalized,
+            t3_normalized,
+        )
+
+    def forward(
+        self,
+        features: Tuple[Tensor, Tensor, Tensor],
+    ) -> Tensor:
+        descriptors = self.raw_embedding_descriptors(features)
+
+        return self.normalize_descriptors(descriptors)
+
+
+
+class FrozenMuDeNetTeacherV2(nn.Module):
+    """
+    Frozen teacher architecture compatible with the prior ResNet-18
+    distillation replication used in this project.
+
+    Input:  [B, 3, H, W]
+    Output: three [B, embedding_channels, H/2, W/2] maps.
+    """
+
+    def __init__(self, embedding_channels: int = 128, random_seed: int = 42) -> None:
+        super().__init__()
+        self.backbone = FrozenResNet18PyramidV2()
+        self.embedding_builder = UnifiedEmbeddingBuilderV2(
+            output_channels=embedding_channels,
+            random_seed=random_seed,
+        )
+
+    @torch.inference_mode()
+    def forward(self, image: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        features = self.backbone(image)
+        embedding = self.embedding_builder(features)
+        return embedding
+
+
+
+class ContextualResidualR2Head(nn.Module):
+    """Add neighboring-stage context before the terminal channel projection.
+
+    The correction starts at exactly zero, so a newly migrated contextual head
+    initially computes the same function as its legacy 1x1 projection. The
+    3x3 layer is deliberately linear and residual to match the architecture
+    proven by the probe-only investigation.
+    """
+
+    def __init__(self, input_channels: int, output_channels: int) -> None:
+        super().__init__()
+        if input_channels < 1 or output_channels < 1:
+            raise ValueError("Contextual head channel counts must be positive.")
+        self.correction = nn.Conv2d(
+            input_channels,
+            input_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=1,
+            bias=False,
+        )
+        self.projection = nn.Conv2d(
+            input_channels,
+            output_channels,
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            groups=1,
+            bias=True,
+        )
+        nn.init.zeros_(self.correction.weight)
+
+    def forward(self, features: Tensor) -> Tensor:
+        return self.projection(features + self.correction(features))
+
+class LogicalReconstructionNetR2V6(nn.Module):
+    """Native-resolution reconstruction from a compact sequential encoder.
+
+    For a 640x640 input, the encoder and selected stage outputs are::
+
+        Conv(3,  8, 3, 4) -> [B,  8, 160, 160]
+        Conv(8, 16, 3, 2) -> [B, 16,  80,  80]  stage 1
+        Conv(16,32, 3, 2) -> [B, 32,  40,  40]  stage 2
+        Conv(32,64, 3, 2) -> [B, 64,  20,  20]  stage 3
+
+    Each selected stage has an independent zero-initialized 3x3 residual
+    correction followed by a dense 1x1 output projection. Outputs stay at
+    their native resolutions, so the network performs no interpolation or
+    transposed convolution.
+    """
+
+    def __init__(
+        self,
+        image_size: int,
+        output_specs: Sequence[FeatureSpec],
+    ) -> None:
+        super().__init__()
+        if image_size < 32 or image_size % 32 != 0:
+            raise ValueError(
+                "image_size must be a positive multiple of 32, "
+                f"got {image_size}."
+            )
+        if len(output_specs) != 3:
+            raise ValueError("R2 V5 requires exactly three output specifications.")
+        if any(
+            spec.channels < 1 or spec.height < 1 or spec.width < 1
+            for spec in output_specs
+        ):
+            raise ValueError("All output feature dimensions must be positive.")
+
+        native_sizes = (
+            (image_size // 8, image_size // 8),
+            (image_size // 16, image_size // 16),
+            (image_size // 32, image_size // 32),
+        )
+        for index, (spec, native_size) in enumerate(
+            zip(output_specs, native_sizes),
+            start=1,
+        ):
+            if (spec.height, spec.width) != native_size:
+                raise ValueError(
+                    f"R2 V5 output {index} must use its native stage size "
+                    f"{native_size}, got {(spec.height, spec.width)}."
+                )
+
+        self.image_size = image_size
+        self.output_specs = tuple(output_specs)
+        self.encoder = nn.Sequential(
+            Conv(3, 8, 3, 4),
+            Conv(8, 16, 3, 2),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+        )
+        self.heads = nn.ModuleList(
+            [
+                ContextualResidualR2Head(
+                    input_channels=stage_channels,
+                    output_channels=spec.channels,
                 )
                 for stage_channels, spec in zip(
                     (16, 32, 64),

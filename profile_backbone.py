@@ -55,6 +55,64 @@ def format_output_shapes(output: object) -> str:
     return f"<{type(output).__name__}>"
 
 
+def find_linear_stage_container(
+    module: nn.Module,
+) -> tuple[str, nn.Sequential | nn.ModuleList] | None:
+    """Return a nested container that represents a module's linear pipeline.
+
+    Some composite stages, including the transpose decoders, keep their
+    ordered operations in a ``model`` or ``network`` attribute. Restricting
+    recursive reporting to these known pipeline attributes avoids treating
+    branch-oriented containers such as a C2f ``ModuleList`` as though every
+    child consumed the previous child's complete output.
+    """
+
+    if isinstance(module, (nn.Sequential, nn.ModuleList)):
+        return "", module
+
+    for attribute_name in ("model", "network"):
+        container = getattr(module, attribute_name, None)
+        if isinstance(container, (nn.Sequential, nn.ModuleList)):
+            return attribute_name, container
+
+    return None
+
+
+def print_nested_stage_macs(
+    module: nn.Module,
+    inputs: object,
+    stage_path: str,
+    indentation: int = 4,
+) -> None:
+    """Print MACs and output shapes for a composite stage's linear children."""
+
+    nested = find_linear_stage_container(module)
+    if nested is None:
+        return
+
+    container_name, children = nested
+    child_input = inputs
+    container_path = (
+        f"{stage_path}.{container_name}" if container_name else stage_path
+    )
+    for index, child in enumerate(children):
+        child_result = count_macs(child, child_input)
+        child_path = f"{container_path}.{index}"
+        print(
+            f"{' ' * indentation}{child_path} "
+            f"[{type(child).__name__}]: "
+            f"{child_result.macs / 1e6:10.3f} MMACs "
+            f"-> {format_output_shapes(child_result.output)}"
+        )
+        print_nested_stage_macs(
+            child,
+            child_input,
+            child_path,
+            indentation=indentation + 2,
+        )
+        child_input = child_result.output
+
+
 def count_macs(module: nn.Module, inputs: object) -> MacResult:
     """Count convolution, transposed-convolution, and attention MACs."""
 
@@ -298,6 +356,7 @@ def main() -> None:
                 f"  {index}: {stage_result.macs / 1e6:10.3f} MMACs "
                 f"-> {format_output_shapes(stage_result.output)}"
             )
+            print_nested_stage_macs(stage, stage_input, str(index))
             stage_input = stage_result.output
     else:
         print("\nPer-stage MACs: unavailable (model.model is not sequential)")
