@@ -25,6 +25,7 @@ from modules import (
     TransposeDecoderV4,
     TransposeDecoderV5,
     TransposeDecoderV6,
+    TransposeDecoderV7,
     LogicalReconstructionNetR2V2,
     LogicalReconstructionNetR2V3,
     LogicalReconstructionNetR2V4,
@@ -1360,6 +1361,43 @@ class YOLOv11BackboneVariantV63(nn.Module):
                 padding=0,
             ),
             TransposeDecoderV6(
+                latent_dim=self.latent_dim,
+                output_spec=self.feature_spec,
+            ),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+class YOLOv11BackboneVariantV64(nn.Module):
+    def __init__(self, in_channels=3, latent_dim=256):
+        super().__init__()
+        self.feature_spec = FeatureSpec(
+            channels=64,
+            height=80,
+            width=80,
+        )
+        self.latent_dim = latent_dim
+
+        self.model = nn.Sequential(
+            # Explicit padding=0 creates exactly 40x40 non-overlapping patches
+            # from a 640x640 image; automatic padding would produce 41x41.
+            Conv(in_channels, 16, 16, 16, p=0),
+            Conv(16, 32, 3, 2),
+            Conv(32, 64, 3, 2),
+            Conv(64, 128, 3, 2),
+            # Apply spatial attention at 5x5, where its token interactions are
+            # substantially cheaper than at earlier high-resolution stages.
+            PSABlock(128, 0.5, 4, True),
+            # Learned full-spatial projection: 128x5x5 -> latent_dim x1x1.
+            nn.Conv2d(
+                128,
+                self.latent_dim,
+                kernel_size=5,
+                stride=1,
+                padding=0,
+            ),
+            TransposeDecoderV7(
                 latent_dim=self.latent_dim,
                 output_spec=self.feature_spec,
             ),

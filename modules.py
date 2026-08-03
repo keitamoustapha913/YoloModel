@@ -938,6 +938,76 @@ def _build_progressive_reduction_stage_channels(
     return channels
 
 
+def _build_contract_expand_stage_channels(
+    latent_dim: int,
+    output_channels: int,
+    num_stages: int,
+) -> list[int]:
+    """Build a channel hourglass for progressive spatial reconstruction.
+
+    The schedule halves channels whenever possible, but reserves enough
+    remaining spatial stages to reach ``output_channels`` using at most one
+    channel doubling per stage. The final stage is always exactly the requested
+    output width. This avoids holding every spatial stage at the final width
+    while also preventing an unrecoverably narrow channel bottleneck.
+
+    Args:
+        latent_dim: Number of channels in the 1x1 latent tensor.
+        output_channels: Required channels in the final feature map.
+        num_stages: Number of learned spatial stages, including the seed.
+
+    Returns:
+        One channel count per spatial stage. Values contract toward the
+        narrowest safe width and expand again when required to reach the final
+        output width.
+
+    Examples:
+        A 20x20 decoder has three stages at 5x5, 10x10, and 20x20::
+
+            >>> _build_contract_expand_stage_channels(256, 128, 3)
+            [128, 64, 128]
+
+        An 80x80 decoder has five stages and can contract further::
+
+            >>> _build_contract_expand_stage_channels(256, 64, 5)
+            [128, 64, 32, 32, 64]
+    """
+
+    if latent_dim < 1:
+        raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+    if output_channels < 1:
+        raise ValueError(
+            f"output_channels must be positive, got {output_channels}."
+        )
+    if num_stages < 1:
+        raise ValueError(f"num_stages must be positive, got {num_stages}.")
+    if num_stages == 1:
+        return [output_channels]
+
+    channels: list[int] = []
+    previous_channels = latent_dim
+    for stage_index in range(num_stages):
+        remaining_stages = num_stages - stage_index - 1
+        if remaining_stages == 0:
+            stage_channels = output_channels
+        else:
+            halved_channels = max(1, previous_channels // 2)
+            # If R stages remain, C must be at least ceil(target / 2**R)
+            # so repeated doubling can still reach the requested output.
+            minimum_recoverable_channels = math.ceil(
+                output_channels / (2**remaining_stages)
+            )
+            stage_channels = max(
+                halved_channels,
+                minimum_recoverable_channels,
+            )
+
+        channels.append(stage_channels)
+        previous_channels = stage_channels
+
+    return channels
+
+
 
 class TransposeDecoder(nn.Module):
     """Decode [B, Z, 1, 1] into one requested teacher-map shape."""
@@ -1523,6 +1593,161 @@ class TransposeDecoderV6(nn.Module):
         if output.shape[-2:] != expected_size:
             raise RuntimeError(
                 "TransposeDecoderV6 failed to generate its requested output "
+                f"size {expected_size}; got {output.shape[-2:]}."
+            )
+        return output
+
+
+class TransposeDecoderV7(nn.Module):
+    """Expressive narrow-seed decoder with dense spatial reconstruction.
+
+    V6 preserves the wide latent channel count in its learned spatial seed.
+    That is expressive but expensive when, for example, a 256-channel latent
+    tensor creates a 256-channel 5x5 map. V7 maps the complete latent vector
+    directly into a narrower spatial seed, continues contracting while enough
+    stages remain, and expands channels again to meet the requested output.
+
+    Unlike projecting channels down at 1x1, the direct spatial seed exposes
+    many more learned values than the latent contains and can therefore retain
+    the complete latent rank. V7 halves channels only when the remaining
+    spatial stages can still double back to the requested output width. For a
+    256-channel latent and a 64x80x80 target, the path is::
+
+        spatial:   1 ->  5 -> 10 -> 20 -> 40 -> 80
+        channels: 256 -> 128 -> 64 -> 32 -> 32 -> 64
+
+    All learned channel mappings use ``groups=1``. Spatial expansion remains
+    fully learned through transposed convolutions, and no interpolation or
+    sub-pixel rearrangement is used.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        output_spec: FeatureSpec,
+    ) -> None:
+        super().__init__()
+        self.output_spec = output_spec
+
+        if latent_dim <= 0:
+            raise ValueError(f"latent_dim must be positive, got {latent_dim}.")
+        if output_spec.channels <= 0:
+            raise ValueError(
+                "TransposeDecoderV7 requires positive output channels, got "
+                f"{output_spec.channels}."
+            )
+        if output_spec.height != output_spec.width:
+            raise ValueError(
+                "TransposeDecoderV7 requires a square output so it can reach "
+                "the requested size without interpolation, got "
+                f"{output_spec.height}x{output_spec.width}."
+            )
+
+        target_extent = output_spec.height
+        if target_extent < 4:
+            raise ValueError(
+                "TransposeDecoderV7 requires an output extent of at least 4, "
+                f"got {target_extent}."
+            )
+
+        power_of_two_target = is_power_of_two(target_extent)
+        if power_of_two_target:
+            seed_extent = 4
+            num_doublings = int(math.log2(target_extent)) - 2
+        else:
+            if target_extent % 2 != 0:
+                raise ValueError(
+                    "TransposeDecoderV7 requires the output extent to be a "
+                    "power of two or divisible by 2, got "
+                    f"{target_extent}."
+                )
+
+            seed_extent = target_extent
+            num_doublings = 0
+            while seed_extent % 2 == 0:
+                seed_extent //= 2
+                num_doublings += 1
+
+            if seed_extent == 1:
+                raise RuntimeError(
+                    "Internal V7 extent decomposition failed for a "
+                    "non-power-of-two target."
+                )
+
+        num_spatial_stages = num_doublings + 1
+        stage_channels = _build_contract_expand_stage_channels(
+            latent_dim=latent_dim,
+            output_channels=output_spec.channels,
+            num_stages=num_spatial_stages,
+        )
+
+        if power_of_two_target:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=3,
+                stride=2,
+                padding=0,
+                output_padding=1,
+                groups=1,
+                bias=True,
+            )
+        else:
+            first_stage = nn.ConvTranspose2d(
+                latent_dim,
+                stage_channels[0],
+                kernel_size=seed_extent,
+                stride=1,
+                padding=0,
+                output_padding=0,
+                groups=1,
+                bias=True,
+            )
+
+        layers: list[nn.Module] = [first_stage]
+        if num_spatial_stages > 1:
+            layers.append(nn.ReLU(inplace=True))
+
+        channel_pairs = list(zip(stage_channels[:-1], stage_channels[1:]))
+        for index, (in_channels, out_channels) in enumerate(channel_pairs):
+            layers.append(
+                nn.ConvTranspose2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=2,
+                    padding=1,
+                    output_padding=1,
+                    groups=1,
+                    bias=True,
+                )
+            )
+            if index < len(channel_pairs) - 1:
+                layers.append(nn.ReLU(inplace=True))
+
+        self.latent_dim = latent_dim
+        self.seed_channels = stage_channels[0]
+        self.channel_direction = "contract_expand"
+        self.seed_extent = seed_extent
+        self.stage_channels = tuple(stage_channels)
+        self.model = nn.Sequential(*layers)
+
+    def forward(self, latent: Tensor) -> Tensor:
+        if (
+            latent.ndim != 4
+            or latent.shape[1] != self.latent_dim
+            or latent.shape[-2:] != (1, 1)
+        ):
+            raise ValueError(
+                "TransposeDecoderV7 expects a latent tensor shaped "
+                f"[B, {self.latent_dim}, 1, 1], got {tuple(latent.shape)}."
+            )
+
+        output = self.model(latent)
+        expected_size = (self.output_spec.height, self.output_spec.width)
+        if output.shape[-2:] != expected_size:
+            raise RuntimeError(
+                "TransposeDecoderV7 failed to generate its requested output "
                 f"size {expected_size}; got {output.shape[-2:]}."
             )
         return output
